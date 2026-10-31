@@ -1,0 +1,27 @@
+[Unit]
+Description=Dockpit - Docker Stack Cockpit & System Dashboard
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+# Or run under a dedicated user member of the docker group:
+# User=dockpit
+# Group=docker
+ExecStart=/usr/bin/python3 -m dockpit
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=DOCKPIT_PORT=8989
+Environment=DOCKPIT_HOST=127.0.0.1
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

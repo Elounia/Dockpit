@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dockpit"
+version = "1.0.0"
+authors = [
+  { name="Carl-Emil Berg" },
+]
+description = "A fast, beautiful, real-time Docker container cockpit and host monitor dashboard"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+keywords = ["docker", "cockpit", "monitoring", "dashboard", "containers", "metrics"]
+dependencies = []
+
+[project.urls]
+"Homepage" = "https://github.com/Elounia/dockpit"
+"Bug Tracker" = "https://github.com/Elounia/dockpit/issues"
+
+[project.scripts]
+dockpit = "dockpit.app:main"
+

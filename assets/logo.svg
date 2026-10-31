@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4f46e5" />
+      <stop offset="50%" stop-color="#6366f1" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+    <linearGradient id="whaleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#e0e7ff" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#4f46e5" flood-opacity="0.4" />
+    </filter>
+  </defs>
+  
+  <!-- Outer Rounded Square -->
+  <rect x="5" y="5" width="90" height="90" rx="22" fill="url(#bgGrad)" filter="url(#glow)" />
+  
+  <!-- Cockpit Radar Ring -->
+  <circle cx="50" cy="50" r="32" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2" stroke-dasharray="4 3" />
+  
+  <!-- Docker-style Stack Blocks -->
+  <g fill="url(#whaleGrad)" transform="translate(26, 32)">
+    <!-- Top Row of Containers -->
+    <rect x="18" y="0" width="10" height="8" rx="1.5" />
+    <!-- Middle Row of Containers -->
+    <rect x="6" y="10" width="10" height="8" rx="1.5" />
+    <rect x="18" y="10" width="10" height="8" rx="1.5" />
+    <rect x="30" y="10" width="10" height="8" rx="1.5" />
+    <!-- Bottom Hull / Platform Shape -->
+    <path d="M 0 22 C 0 32, 14 36, 36 36 C 44 36, 48 34, 50 30 C 50 28, 48 24, 46 22 Z" />
+    <!-- Cockpit Target Pointer -->
+    <circle cx="43" cy="28" r="2.5" fill="#06b6d4" />
+  </g>
+</svg>
+

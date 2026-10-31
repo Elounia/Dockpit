@@ -1,0 +1,43 @@
+services:
+  dockpit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dockpit:latest
+    container_name: dockpit
+    restart: unless-stopped
+    # By default, bind strictly to localhost (127.0.0.1) for security.
+    # To expose behind a reverse proxy with Authelia / SSO, see docs/AUTHELIA_SSO.md
+    ports:
+      - "127.0.0.1:8989:8989"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DOCKPIT_PORT=8989
+      - DOCKPIT_HOST=0.0.0.0 # Container listens internally, host port is bounded to 127.0.0.1
+      # Optional: set custom secondary storage mount path to monitor
+      # - DOCKPIT_SECONDARY_STORAGE_PATH=/host/data
+      # - DOCKPIT_SECONDARY_STORAGE_LABEL="Secondary Storage"
+    volumes:
+      # Docker socket access (read-only)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host metrics access (read-only)
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+      # Optional: mount secondary storage disk for monitoring
+      # - /mnt/data:/host/data:ro
+    # Run with docker group permissions so it can read /var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-984}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
