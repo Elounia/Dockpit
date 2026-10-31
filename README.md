@@ -44,8 +44,7 @@
   - **Storage:** Complete physical block device inventory (`/dev/nvme*`, `/dev/sd*`), hardware serial numbers, persistent Disk IDs (`by-id` with one-click copy), partition maps, filesystem types, and live mount usage.
   - **System & Runtime:** Linux kernel version, OS distribution, host uptime, Docker Engine, containerd/runc versions, and fleet health.
 - **📊 Normalized 0–100% Host CPU:** Solves the multi-core Docker CLI confusion where multi-threaded containers report misleading numbers like `600%` or `1200%`. Dockpit computes real, normalized host utilization across all CPU cores.
-- **💾 True Resident Memory (RSS):** Docker stats often include reclaimable Linux page buffers / file cache, making containers look falsely starved for RAM. Dockpit accurately isolates active memory from inactive cache:
-  $$\text{Used Memory} = \max(0, \text{usage} - \text{inactive\_file})$$
+- **💾 True Resident Memory (RSS):** Docker stats often include reclaimable Linux page buffers / file cache, making containers look falsely starved for RAM. Dockpit accurately isolates active memory from inactive cache (`Used Memory = max(0, usage - inactive_file)`).
 - **🧩 Stack-First Visual Grouping:** Organizes your entire Docker universe into collapsible Compose projects (`com.docker.compose.project`), complete with aggregate CPU, RAM consumption, and health indicators.
 - **🔒 Hardened Server-Side Secret Stripping:** When inspecting containers, Dockpit strips all environment variables (`Env`) and credentials server-side before delivering JSON to the browser. Tokens, database passwords, and API keys are **never** transmitted over the wire.
 - **⚡ Real-Time Unix Socket Streaming:** Reads directly from `/var/run/docker.sock` via Unix domain socket HTTP connection pools with automatic subprocess fallback.
@@ -131,14 +130,14 @@ Dockpit bridges the Docker Unix Domain Socket and the host's `/proc` filesystem 
 flowchart LR
     subgraph Host["Linux Host"]
         DockerSock["/var/run/docker.sock"]
-        ProcFS["/proc & /sys"]
-        Disks["Root & Storage Mounts"]
+        ProcFS["/proc and /sys"]
+        Disks["Root and Storage Mounts"]
     end
 
     subgraph Dockpit["Dockpit Core Engine (Python 3)"]
         SocketEngine["Unix Socket Connection Pool"]
         SysEngine["Hardware Metrics Analyzer"]
-        Sanitizer["Security Filter & Secret Stripper"]
+        Sanitizer["Security Filter and Secret Stripper"]
         HttpServer["Threading HTTP Server (:8989)"]
     end
 

@@ -67,12 +67,12 @@ flowchart LR
         DockerSock["/var/run/docker.sock :ro"]
     end
 
-    Client -->|1. HTTPS Request| Proxy
-    Proxy -->|2. Forward-Auth Check (/auth/api/authz)| Authelia
-    Authelia -->|3a. 401 Unauthorized| Proxy
-    Proxy -.->|3b. Redirect to Login Portal| Client
-    Authelia -->|4. 200 OK Authorized| Proxy
-    Proxy -->|5. Proxy Pass Request| Dockpit
+    Client -->|"1. HTTPS Request"| Proxy
+    Proxy -->|"2. Forward-Auth Check (/auth/api/authz)"| Authelia
+    Authelia -->|"3a. 401 Unauthorized"| Proxy
+    Proxy -.->|"3b. Redirect to Login Portal"| Client
+    Authelia -->|"4. 200 OK Authorized"| Proxy
+    Proxy -->|"5. Proxy Pass Request"| Dockpit
     DockerSock --> Dockpit
 ```
 

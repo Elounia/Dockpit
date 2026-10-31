@@ -7,20 +7,20 @@ flowchart TD
     subgraph Host["Linux Host"]
         DockerSock["/var/run/docker.sock"]
         ProcFs["/proc (stat, meminfo, uptime)"]
-        RootFs["/ (System Disk) & /data (Secondary)"]
+        RootFs["/ (System Disk) and /data (Secondary)"]
     end
 
     subgraph DockpitCore["Dockpit Core (Python 3 Stdlib)"]
         SocketPoller["Unix Socket Worker / Engine Client"]
         SysMetrics["Host Metrics Engine"]
         CacheState[("Thread-Safe Metrics Cache")]
-        Sanitizer["Security Filter & Secret Stripper"]
+        Sanitizer["Security Filter and Secret Stripper"]
         HttpServer["Threading HTTP Server (:8989)"]
     end
 
     subgraph BrowserClient["Web Browser UI"]
         Dashboard["Glassmorphism UI (Tailwind CSS)"]
-        SearchEngine["Instant Fuzzy Search & Sorters"]
+        SearchEngine["Instant Fuzzy Search and Sorters"]
         InspectModal["Safe Inspection View"]
         LogViewer["Live Terminal Log Stream"]
     end
@@ -35,9 +35,9 @@ flowchart TD
     CacheState --> HttpServer
     DockerSock --> Sanitizer --> HttpServer
 
-    HttpServer -->|/api/stats (JSON)| Dashboard
-    HttpServer -->|/api/inspect (Sanitized)| InspectModal
-    HttpServer -->|/api/logs (Bounded)| LogViewer
+    HttpServer -->|"GET /api/stats (JSON)"| Dashboard
+    HttpServer -->|"GET /api/inspect (Sanitized)"| InspectModal
+    HttpServer -->|"GET /api/logs (Bounded)"| LogViewer
 ```
 
 ---
@@ -65,7 +65,8 @@ Dockpit calculates:
 Many monitoring tools report raw Docker `memory_stats.usage`, which mistakenly includes Linux page cache (inactive file buffers) held by the kernel for filesystem operations. This causes idle databases or file-heavy services to look like they are running out of RAM.
 
 Dockpit extracts:
-$$\text{Used Memory} = \max(0, \text{usage} - \text{inactive\_file})$$
+> **Working Memory Formula:**  
+> `Used Memory = max(0, usage - inactive_file)`
 
 This reflects the real resident memory footprint of each container while comparing it against either container cgroup limits or total host physical RAM.
 
