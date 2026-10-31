@@ -1,0 +1,25 @@
+name: Bug report
+description: Report incorrect behavior or installation problems
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include reproduction steps, expected behavior and actual behavior. Remove credentials from logs and diagnostics.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Dockpit version and installation method
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Host OS, architecture and Docker version
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Check Diagnostics in the dashboard. Do not include container logs containing secrets.

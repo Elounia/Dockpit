@@ -1,232 +1,138 @@
 <div align="center">
+<img src="assets/banner.svg" alt="Dockpit — Docker stacks and host monitoring" width="100%" />
 
-<img src="assets/banner.svg" alt="Dockpit - Modern Docker Stack Cockpit & System Dashboard" width="100%" />
+[![CI](https://github.com/Elounia/dockpit/actions/workflows/ci.yml/badge.svg)](https://github.com/Elounia/dockpit/actions/workflows/ci.yml)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
 
-<br/><br/>
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-3776AB.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg?style=for-the-badge)](pyproject.toml)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg?style=for-the-badge&logo=docker&logoColor=white)](docker-compose.yml)
-[![CI Status](https://img.shields.io/badge/tests-passing-brightgreen.svg?style=for-the-badge&logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
-
-<p align="center">
-  <strong>A blazing fast, ultra-lightweight, real-time Docker container cockpit &amp; host monitor.</strong><br/>
-  Zero external dependencies. Normalized 0–100% host CPU. Stack-first visualization. Hardened server-side secret stripping.
-</p>
-
-[Key Features](#-key-features) •
-[Quickstart](#-quickstart) •
-[Architecture](#-architecture) •
-[Security & Hardening](#-security--hardening) •
-[Configuration](#-configuration) •
-[API Reference](#-api-reference) •
-[Documentation](#-documentation)
-
+A lightweight, read-only dashboard for Docker Compose stacks and Linux hosts.
+No third-party Python runtime dependencies. Browser assets are included and work offline.
 </div>
 
----
+## Preview
 
-## 📸 Dashboard Preview
+![Illustrative dashboard preview](assets/screenshot.svg)
 
-<div align="center">
-  <img src="assets/screenshot.svg" alt="Dockpit Dashboard Preview" width="100%" />
-</div>
+The preview uses sample data. See the running dashboard for current features.
 
----
+## Features
 
-## ✨ Key Features
+- Containers grouped by Compose project, including stopped containers.
+- Host CPU, RAM and storage metrics; Docker CPU totals normalized to host capacity.
+- Cache-adjusted container memory (`Used Memory = max(0, usage - inactive_file)`), per-container limits and network I/O totals.
+- Health overview and a Needs attention filter for unhealthy, exited, dead and restarting containers.
+- CPU/RAM sparklines with up to one hour of in-memory history. History resets on restart.
+- Search, sorting and persistent filters/expanded stacks in browser local storage.
+- Log snapshots refreshed every three seconds, with pause, search, timestamps, copy and download.
+- Container details including restart count, exit code and OOM status. Environment variables and healthcheck log output are excluded from inspection responses.
+- Diagnostics, measurement timestamps, stale-data warnings, liveness and readiness endpoints.
+- Optional labels for application names, icons, links and hiding containers.
 
-- **🚀 Zero External Dependencies:** Built purely on Python 3 standard library (`http.server`, `socket.AF_UNIX`, `concurrent.futures`, `shutil`). No Flask, Django, Node.js runtime, or bulky wheels. Runs everywhere with a tiny **~15 MB memory footprint** and negligible CPU overhead.
-- **🔍 Interactive Hardware & Storage Modals:** Click on any of the 4 top status cards (CPU, RAM, Storage, Containers) to inspect comprehensive hardware details:
-  - **CPU:** Hardware model, vendor, frequency (MHz), L1-L3 cache sizes, core/thread topology, flags, and real-time load averages.
-  - **RAM:** Full memory distribution (Active RSS, purgeable page cache, slab, shared memory, swap utilization).
-  - **Storage:** Complete physical block device inventory (`/dev/nvme*`, `/dev/sd*`), hardware serial numbers, persistent Disk IDs (`by-id` with one-click copy), partition maps, filesystem types, and live mount usage.
-  - **System & Runtime:** Linux kernel version, OS distribution, host uptime, Docker Engine, containerd/runc versions, and fleet health.
-- **📊 Normalized 0–100% Host CPU:** Solves the multi-core Docker CLI confusion where multi-threaded containers report misleading numbers like `600%` or `1200%`. Dockpit computes real, normalized host utilization across all CPU cores.
-- **💾 True Resident Memory (RSS):** Docker stats often include reclaimable Linux page buffers / file cache, making containers look falsely starved for RAM. Dockpit accurately isolates active memory from inactive cache (`Used Memory = max(0, usage - inactive_file)`).
-- **🧩 Stack-First Visual Grouping:** Organizes your entire Docker universe into collapsible Compose projects (`com.docker.compose.project`), complete with aggregate CPU, RAM consumption, and health indicators.
-- **🔒 Hardened Server-Side Secret Stripping:** When inspecting containers, Dockpit strips all environment variables (`Env`) and credentials server-side before delivering JSON to the browser. Tokens, database passwords, and API keys are **never** transmitted over the wire.
-- **⚡ Real-Time Unix Socket Streaming:** Reads directly from `/var/run/docker.sock` via Unix domain socket HTTP connection pools with automatic subprocess fallback.
-- **🔎 Instant Fuzzy Search & Quick Filters:** Live filtering across container names, services, image tags, published ports, and storage tiers (Root vs Secondary storage).
-- **📋 Live Container Logs & Safe Inspection:** Tail live container logs (stdout/stderr) with bounded payloads (max 1 MB / 500 lines) and one-click clipboard copying.
-- **🛡️ Injection-Proof API:** Strictly sanitizes container names against alphanumeric whitelist regex and active memory tables. Flags like `--help` or shell escapes are safely rejected with HTTP 400.
-
----
-
-## ⚡ Quickstart
-
-### Option 1: Docker Compose (Recommended)
-
-Clone the repository and spin up Dockpit in seconds:
+## Quickstart — Linux and Docker Compose
 
 ```bash
 git clone https://github.com/Elounia/dockpit.git
 cd dockpit
-docker compose up -d
+export DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+docker compose up -d --build
 ```
 
-Access the dashboard at **`http://localhost:8989`** (or your server's IP address).
-
-### Option 2: Docker CLI
+Open **http://localhost:8989** on the Docker host. From another machine, use an SSH tunnel, Tailscale Serve or an authenticated reverse proxy; the published port binds to localhost.
 
 ```bash
-docker run -d \
-  --name dockpit \
-  --restart unless-stopped \
+# From your workstation:
+ssh -L 8989:127.0.0.1:8989 user@your-server
+```
+
+The socket's group ID varies by host. Compose requires `DOCKER_GID` rather than guessing it. Rootless Docker uses a different socket path; see [deployment](docs/DOCKER.md).
+
+### Docker CLI
+
+Build the local image first:
+
+```bash
+docker build -t dockpit:local .
+docker run -d --name dockpit --restart unless-stopped \
   -p 127.0.0.1:8989:8989 \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  -v /proc:/host/proc:ro \
-  -v /sys:/host/sys:ro \
-  -v /:/host/root:ro \
-  --read-only \
-  --cap-drop ALL \
-  --security-opt no-new-privileges:true \
-  dockpit:latest
+  -v /proc:/host/proc:ro -v /sys:/host/sys:ro -v /:/host/root:ro \
+  --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  --tmpfs /tmp dockpit:local
 ```
 
-### Option 3: Standalone Python (No Docker Required for Host)
+Prebuilt images are published for amd64 and arm64: `ghcr.io/elounia/dockpit:1.1.0`. Run `docker pull ghcr.io/elounia/dockpit:1.1.0` and use that image in place of `dockpit:local` in the command above.
 
-Dockpit has **zero third-party dependencies**. Run it directly with Python 3.9+:
+### Standalone Python
 
 ```bash
-git clone https://github.com/Elounia/dockpit.git
-cd dockpit
-
-# Launch directly (binds to 127.0.0.1 by default)
-./bin/dockpit
-# or: python3 -m dockpit
+python3 -m dockpit
+# Or install into a virtual environment:
+python3 -m venv .venv
+.venv/bin/pip install .
+.venv/bin/dockpit
 ```
 
-Open `http://localhost:8989`.
+Requires Linux procfs and access to the Docker socket. If the socket is absent, Dockpit uses the Docker CLI. There is no Docker CLI in the provided container image. Python 3.9 remains compatible; CI also tests newer interpreters.
 
----
+## Security model
 
-## 🔒 Remote Access: Tailscale (Recommended) & Authelia SSO
+Dockpit has **no built-in authentication**. Keep it on a trusted host or behind a VPN/authenticated reverse proxy. The supplied Compose file publishes only on `127.0.0.1`; the container itself listens on `0.0.0.0` internally.
 
-Dockpit is configured out-of-the-box with **strict localhost isolation** (`127.0.0.1:8989`). Docker management tools should **never** be exposed unauthenticated to the public internet.
+- The HTTP API exposes read operations. **Mounting `docker.sock:ro` does not make Docker API access read-only.** Socket access to a rootful daemon is highly privileged, even when Dockpit runs as UID 1000. Consider a Docker authorization proxy restricting allowed endpoints.
+- Host filesystem mounts expose host information to the process. Restrict access to the dashboard and host.
+- Inspection excludes `Config.Env`, command arguments and healthcheck output. Logs, mount paths and network information may still contain sensitive data. Log exports retain their original contents.
+- External values are escaped before HTML rendering; log contents are rendered as text. A Content Security Policy restricts scripts to local files. Cross-origin API access is not enabled.
+- Log responses and reads are bounded to 1 MiB and requests to 500 lines. These limits can truncate a large line or snapshot.
 
-### 🥇 Recommended Baseline: Tailscale (Private Mesh VPN)
-For personal, home lab, and team server administration, the **recommended default approach is to use Tailscale** (or WireGuard / Headscale):
-- **Zero Open Internet Ports:** Dockpit remains strictly bound to `127.0.0.1` or your private Tailscale IP (`100.x.y.z`), requiring no port-forwarding on your router or cloud firewall.
-- **Identity-Based Authentication:** Access is governed by your Tailscale tailnet SSO (Google, GitHub, Microsoft, Okta) with built-in multi-factor authentication (MFA).
-- **Automatic HTTPS with MagicDNS:** Use `tailscale serve` to instantly get valid Let's Encrypt HTTPS certificates for `https://dockpit.<your-tailnet>.ts.net` without exposing any public web servers.
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting and [remote access](docs/AUTHELIA_SSO.md) for proxy/VPN deployment.
 
-### 🥈 Alternative: Authelia Single Sign-On (Forward-Auth)
-If you require browser access under a public domain (e.g. `https://dockpit.yourdomain.com`) without installing VPN software on client devices:
-- **Isolated Admin Network:** Dockpit runs on an internal Docker bridge network (`dockpit_admin`) without publishing ports to the host.
-- **Forward-Auth Verification:** Nginx / Traefik / Caddy intercepts incoming requests and validates identity via Authelia's auth verification endpoint.
-- **Enforced 2FA & RBAC:** Unauthenticated users are redirected to your Authelia 2FA portal (TOTP / WebAuthn security keys), restricting dashboard access to authorized admin groups (`group:admins`).
+## Configuration
 
-👉 **Read the complete guide for both Tailscale and Authelia setups in [docs/AUTHELIA_SSO.md](docs/AUTHELIA_SSO.md).**
-
----
-
-## 📐 Architecture
-
-Dockpit bridges the Docker Unix Domain Socket and the host's `/proc` filesystem directly into an ultra-fast, reactive browser client:
-
-```mermaid
-flowchart LR
-    subgraph Host["Linux Host"]
-        DockerSock["/var/run/docker.sock"]
-        ProcFS["/proc and /sys"]
-        Disks["Root and Storage Mounts"]
-    end
-
-    subgraph Dockpit["Dockpit Core Engine (Python 3)"]
-        SocketEngine["Unix Socket Connection Pool"]
-        SysEngine["Hardware Metrics Analyzer"]
-        Sanitizer["Security Filter and Secret Stripper"]
-        HttpServer["Threading HTTP Server (:8989)"]
-    end
-
-    subgraph UI["Glassmorphism UI"]
-        WebDashboard["Dashboard & Filters"]
-        SafeInspector["Sanitized Inspector"]
-        LogViewer["Live Terminal Viewer"]
-    end
-
-    DockerSock --> SocketEngine
-    ProcFS --> SysEngine
-    Disks --> SysEngine
-    SocketEngine --> HttpServer
-    SysEngine --> HttpServer
-    DockerSock --> Sanitizer --> HttpServer
-
-    HttpServer --> WebDashboard
-    HttpServer --> SafeInspector
-    HttpServer --> LogViewer
-```
-
-For comprehensive technical insights, read [ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
----
-
-## 🛡️ Security & Hardening
-
-Dockpit is built for production environments and home labs alike:
-
-| Security Measure | Implementation |
-|---|---|
-| **Secret Stripping** | Environment variables (`Env`) containing passwords, tokens, and keys are removed server-side before returning inspect data. |
-| **Input Validation** | Container identifiers must match `^[a-zA-Z0-9_\.\-]+$` and be present in active memory. Injection flags (e.g. `--help`, command chaining) are rejected. |
-| **Bounded Payloads** | Log streams are capped at 500 lines and truncated to 1 MiB to avoid memory exhaustion attacks. |
-| **Rootless Container** | Container runs under UID 1000 (`dockpit:dockpit`), drops all capabilities (`cap_drop: ALL`), and mounts a `read_only` root filesystem. |
-| **Reverse Proxy Ready** | Works seamlessly behind Authelia, Authentik, Caddy, Traefik, Nginx, or Cloudflare Tunnels. |
-
----
-
-## ⚙️ Configuration
-
-Configure Dockpit using environment variables:
-
-| Variable | Default | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `DOCKPIT_PORT` | `8989` | Port to bind the web dashboard and REST API |
-| `DOCKPIT_HOST` | `127.0.0.1` | Host interface to listen on (`127.0.0.1` for local-only, `0.0.0.0` within isolated networks) |
-| `DOCKPIT_DOCKER_SOCKET` | `/var/run/docker.sock` | Path to the Docker Unix domain socket |
-| `DOCKPIT_POLL_INTERVAL` | `2.0` | Background metrics poll interval in seconds |
-| `DOCKPIT_PROC_DIR` | `/host/proc` or `/proc` | Path to host procfs |
-| `DOCKPIT_ROOT_DIR` | `/host/root` or `/` | Path to host root filesystem |
-| `DOCKPIT_SECONDARY_STORAGE_PATH` | *auto-detected* | Custom path to secondary storage mount (e.g. `/mnt/data`) |
-| `DOCKPIT_SECONDARY_STORAGE_LABEL` | `"Data Storage"` | Friendly display label for secondary storage disk |
+| `DOCKPIT_HOST` | `127.0.0.1` natively; `0.0.0.0` in Docker | Listen address |
+| `DOCKPIT_PORT` | `8989` | HTTP port |
+| `DOCKPIT_DOCKER_SOCKET` | `/var/run/docker.sock` | Unix socket path |
+| `DOCKPIT_POLL_INTERVAL` | `2.0` | Seconds between completed polls, range 0.5–3600 |
+| `DOCKPIT_PROC_DIR` | `/host/proc` when mounted, otherwise `/proc` | Host procfs |
+| `DOCKPIT_ROOT_DIR` | `/host/root` when mounted, otherwise `/` | Host filesystem |
+| `DOCKPIT_SECONDARY_STORAGE_PATH` | Auto-detected | Path visible inside Dockpit, e.g. `/host/root/mnt/data` |
+| `DOCKPIT_SECONDARY_STORAGE_LABEL` | `Data Storage` | Storage display name |
 
----
+Unavailable host measurements are marked as unavailable. A snapshot becomes stale after the greater of 30 seconds or three poll intervals. Poll failures preserve the last snapshot and are reported in Diagnostics.
 
-## 📡 API Reference
+### Container labels
 
-Dockpit includes a clean, read-only REST API:
+```yaml
+services:
+  app:
+    labels:
+      dockpit.name: My application
+      dockpit.icon: fa-globe
+      dockpit.url: https://app.example.com
+      # dockpit.hide: "true"
+```
 
-- **`GET /api/stats`**: Full JSON snapshot of all Docker stacks, containers, host CPU/RAM, and storage tiers.
-- **`GET /api/inspect?name=<container>`**: Safe runtime container inspection with secrets stripped.
-- **`GET /api/logs?name=<container>&tail=100`**: Live bounded stdout/stderr log stream.
+`dockpit.url` accepts HTTP(S) URLs only. `dockpit.icon` is a Font Awesome solid icon class. Hidden containers are excluded from Dockpit's inventory, totals and inspection/log allowlist; this is display configuration, not an authorization mechanism. Host metrics still cover the entire host. CLI fallback has less metadata than the socket backend.
 
-Full API documentation and response schemas are detailed in [API.md](docs/API.md).
-
----
-
-## 📚 Documentation
-
-- [Architecture & Design Details](docs/ARCHITECTURE.md)
-- [Securing with Authelia SSO & Reverse Proxy](docs/AUTHELIA_SSO.md)
-- [Deployment Guide (Docker, Compose, Proxies, Systemd)](docs/DOCKER.md)
-- [REST API Specifications](docs/API.md)
-- [Contributing Guidelines](CONTRIBUTING.md)
-
----
-
-## 🧪 Testing
-
-Dockpit features 100% standard library test suites. Run tests with:
+## Development and validation
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 -m pip wheel --no-deps --wheel-dir dist .
 ```
 
----
+CSS and fonts are committed, so running or installing Dockpit requires no frontend build. To change styling, use the Tailwind CSS 3.4.17 standalone CLI with `TAILWINDCSS=/path/to/tailwindcss scripts/build-css.sh`. See [CONTRIBUTING.md](CONTRIBUTING.md) for browser and Docker checks.
 
-## 📄 License & Author
+## Documentation
 
-**Dockpit** is open-source software authored by **Carl-Emil Berg** and licensed under the **[MIT License](LICENSE)**.
+- [Deployment and systemd](docs/DOCKER.md)
+- [API reference](docs/API.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Tailscale and Authelia](docs/AUTHELIA_SSO.md)
+- [Release checklist](docs/RELEASING.md)
+- [Changelog](CHANGELOG.md)
+- [Third-party asset licenses](THIRD_PARTY_NOTICES.md)
 
+Dockpit is authored by Carl-Emil Berg and distributed under the [MIT License](LICENSE).

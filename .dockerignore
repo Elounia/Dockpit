@@ -3,7 +3,16 @@
 tests
 docs
 assets
+scripts
 *.code-workspace
 __pycache__
-*.pyc
+*.py[cod]
 .pytest_cache
+.venv
+venv
+dist
+build
+*.egg-info
+.env
+.env.*
+*.log

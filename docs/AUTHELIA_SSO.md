@@ -1,5 +1,7 @@
 # Securing Dockpit Remote Access: Tailscale & Authelia SSO
 
+Run Compose examples from the repository root. Before starting, set `export DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"`.
+
 By default, Dockpit binds strictly to **`127.0.0.1:8989`** (localhost only). Because Dockpit interfaces with `/var/run/docker.sock` and the host operating system, it should **never** be exposed unauthenticated to the public internet or an untrusted local network.
 
 This guide covers the two standard, hardened approaches for accessing your Dockpit instance remotely:
@@ -10,11 +12,11 @@ This guide covers the two standard, hardened approaches for accessing your Dockp
 
 ## 🥇 Recommended Baseline: Tailscale Private Mesh VPN
 
-For 95% of home labs, developers, and infrastructure teams, **Tailscale** (or Headscale / WireGuard) is the safest, simplest, and most robust way to access Dockpit.
+A private VPN such as Tailscale, Headscale or WireGuard can provide remote access without publishing the dashboard to the public internet.
 
 ### Why Tailscale is the Recommended Default:
 - **Zero Exposed Ports:** Your server needs no port forwarding on your router, no NAT traversal holes, and no public DNS records pointing to your IP.
-- **Hardware-Level and Identity-Level Authentication:** Access is restricted to devices authenticated into your private "tailnet" via your identity provider (Google, GitHub, Microsoft, Okta) with mandatory 2FA.
+- **Hardware-Level and Identity-Level Authentication:** Access is restricted to devices authenticated into your private "tailnet" via your identity provider (Google, GitHub, Microsoft, Okta) ; enable MFA and configure access policy in your identity provider.
 - **End-to-End Encryption:** All traffic between your client laptop/phone and the host running Dockpit is encrypted via WireGuard.
 
 ### Method A: Serve via Tailscale HTTPS (One Command)
@@ -119,7 +121,8 @@ services:
 
   # 3. Dockpit Dashboard (Isolated)
   dockpit:
-    image: dockpit:latest
+    build: .
+    image: dockpit:local
     container_name: dockpit
     restart: unless-stopped
     # NOTICE: No 'ports' section! Dockpit is only reachable by the gateway on the internal network.
@@ -133,7 +136,7 @@ services:
       - /sys:/host/sys:ro
       - /:/host/root:ro
     group_add:
-      - "${DOCKER_GID:-984}"
+      - "${DOCKER_GID:?Set DOCKER_GID from the Docker socket group}"
     read_only: true
     cap_drop:
       - ALL
@@ -339,6 +342,6 @@ dockpit.yourdomain.com {
 - [x] Host binding strictly set to `127.0.0.1:8989` or isolated within a Docker bridge network.
 - [x] TLS / SSL certificate installed on perimeter reverse proxy with HTTPS redirection.
 - [x] Authelia access control policy set to `two_factor` for the Dockpit domain.
-- [x] Docker socket mounted as read-only (`:ro`).
-- [x] Dockpit container running rootless (`dockpit:dockpit`, UID 1000) with `read_only: true` and `cap_drop: ALL`.
+- [x] Docker socket authority understood: `:ro` does not restrict Docker API methods.
+- [x] Dockpit process running as a non-root user (`dockpit:dockpit`, UID 1000) with `read_only: true` and `cap_drop: ALL`.
 

@@ -1,132 +1,51 @@
-# Deployment & Integration Guide
+# Deployment
 
-Dockpit can be deployed as a Docker container, managed via Docker Compose / Portainer, or run directly as a systemd service.
+## Docker Compose
 
----
-
-## 1. Quick Run with Docker CLI
-
-To launch Dockpit in a single command (bound safely to localhost):
+From the repository root:
 
 ```bash
-docker run -d \
-  --name dockpit \
-  --restart unless-stopped \
-  -p 127.0.0.1:8989:8989 \
-  -v /var/run/docker.sock:/var/run/docker.sock:ro \
-  -v /proc:/host/proc:ro \
-  -v /sys:/host/sys:ro \
-  -v /:/host/root:ro \
-  --read-only \
-  --cap-drop ALL \
-  --security-opt no-new-privileges:true \
-  dockpit:latest
+export DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=50
 ```
 
-Open `http://localhost:8989` in your web browser.
+The port is published on `127.0.0.1:8989`. Use an SSH tunnel, VPN or authenticated reverse proxy for remote access. A bare Caddy/Nginx reverse proxy does not add authentication. See [AUTHELIA_SSO.md](AUTHELIA_SSO.md).
 
----
+Read [SECURITY.md](../SECURITY.md) before mounting the Docker socket and host filesystem. `:ro` on a Unix socket does not restrict Docker API operations. The process runs as UID 1000 with the socket's host group added. This is not a rootless Docker daemon.
 
-## 2. Docker Compose (Recommended)
+The image's healthcheck calls `/readyz`, which fails if no successful Docker snapshot exists or measurements are stale. `/healthz` checks HTTP liveness independently of Docker connectivity. Diagnostics in the dashboard reports the latest polling failure.
 
-Save the following as `docker-compose.yml`:
+For an optional secondary disk, set a path visible inside Dockpit, for example `DOCKPIT_SECONDARY_STORAGE_PATH=/host/root/mnt/data`.
 
-```yaml
-services:
-  dockpit:
-    image: dockpit:latest
-    container_name: dockpit
-    restart: unless-stopped
-    # Strictly bound to localhost for security
-    ports:
-      - "127.0.0.1:8989:8989"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - DOCKPIT_PORT=8989
-      - DOCKPIT_HOST=0.0.0.0
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/host/root:ro
-    # Run with docker group permissions to access the docker socket
-    group_add:
-      - "${DOCKER_GID:-984}"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-```
+## Docker CLI
 
-Start the service:
-```bash
-docker compose up -d
-```
+Use the complete build and run example in [README.md](../README.md#docker-cli). Both the local image build and `--group-add` are required. When release images exist, replace `dockpit:local` with a versioned GHCR image.
 
----
+## Rootless Docker
 
-## 3. Remote Access: Tailscale (Recommended) & Authelia SSO
+Find the rootless daemon socket (usually `$XDG_RUNTIME_DIR/docker.sock`). Mount that path at `/var/run/docker.sock` inside Dockpit and derive `DOCKER_GID` from the actual socket. The service account must have access to the socket; subordinate UID/GID mappings can require additional configuration. Validate using Diagnostics. Host metrics and Docker Desktop VM metrics are not equivalent; the primary supported deployment is a native Linux Docker host.
 
-By default, Dockpit binds strictly to `127.0.0.1:8989`. To access Dockpit remotely:
+## systemd
 
-### 🥇 Recommended: Tailscale (Private Mesh VPN)
-The recommended baseline for home labs and production servers is **Tailscale**:
-- No ports opened on firewalls or routers.
-- Direct authentication through your Google/GitHub/SSO account with mandatory 2FA.
-- Instant HTTPS via `tailscale serve --bg 8989`.
-
-### 🥈 Alternative: Reverse Proxy + Authelia SSO
-If you need public domain web access without client software, place Dockpit behind a reverse proxy (Nginx, Caddy, Traefik) protected by **Authelia forward authentication**.
-
-> [!TIP]
-> For detailed configurations for both Tailscale and Authelia (including complete Docker Compose and Nginx `auth_request` examples), see **[AUTHELIA_SSO.md](AUTHELIA_SSO.md)**.
-
-### Nginx Reverse Proxy Example
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name dockpit.yourdomain.com;
-
-    ssl_certificate /etc/ssl/certs/dockpit.crt;
-    ssl_certificate_key /etc/ssl/private/dockpit.key;
-
-    location / {
-        proxy_pass http://127.0.0.1:8989;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-### Caddy Example
-```caddy
-dockpit.yourdomain.com {
-    reverse_proxy 127.0.0.1:8989
-}
-```
-
----
-
-## 4. Native Linux / Bare Metal Installation
-
-If you prefer to run Dockpit directly on the host machine without Docker virtualization:
+The checked-in unit runs a dedicated account from `/opt/dockpit`, so the package is importable without modifying the system Python installation:
 
 ```bash
-# Clone the repository
-git clone https://github.com/Elounia/dockpit.git /opt/dockpit
-cd /opt/dockpit
-
-# Install systemd unit
-sudo cp dockpit.service /etc/systemd/system/
+sudo git clone https://github.com/Elounia/dockpit.git /opt/dockpit
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin dockpit
+sudo cp /opt/dockpit/dockpit.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dockpit.service
-
-# Check service status
 sudo systemctl status dockpit.service
 ```
 
+The `docker` group must exist and match the socket's permissions. Docker group membership grants daemon privileges. Adjust the unit for rootless Docker. Keep the checkout owned by an administrator; the service account should not be able to modify its own executable code.
+
+## Troubleshooting
+
+- **Permission denied / no snapshots:** verify the socket's GID with `stat -c '%g'`, set `DOCKER_GID`, and recreate the container.
+- **Healthy HTTP but not ready:** check `/api/diagnostics`; the daemon may be down or polls failing.
+- **Stale data:** the latest successful measurement is too old. The banner intentionally retains previous values.
+- **Missing host metrics:** verify procfs/root mounts and permissions. Missing data is not replaced with sample capacity.
+- **Application links:** port links use the dashboard hostname and scheme. Behind a proxy/VPN, use `dockpit.url` for applications that are reached through their own domains; published ports may not be reachable through the dashboard's tunnel.

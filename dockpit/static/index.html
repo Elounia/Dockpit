@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dockpit - Docker Stack Cockpit & System Dashboard</title>
+    <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css">
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="min-h-screen p-4 md:p-6 flex flex-col">
+    <!-- Header -->
+    <header class="max-w-7xl w-full mx-auto mb-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+        <div>
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center text-white shadow-md shadow-indigo-500/20">
+                    <i class="fa-brands fa-docker text-xl"></i>
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold tracking-tight text-white flex items-center gap-2">
+                        Dockpit
+                        <span class="text-[10px] font-mono font-semibold uppercase tracking-wider text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 px-2 py-0.5 rounded-full">v1.1.0</span>
+                    </h1>
+                </div>
+            </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2.5">
+            <div class="flex items-center gap-2 text-xs text-slate-400 glass-card px-3 py-1.5 rounded-xl">
+                <i class="fa-regular fa-clock text-indigo-400"></i>
+                <span id="statusText">Waiting for measurements</span>
+            </div>
+            <button id="toggleAutoBtn" data-action="auto" class="text-xs px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1.5 cursor-pointer">
+                <i id="toggleIcon" class="fa-solid fa-pause"></i>
+                <span id="toggleText">Pause</span>
+            </button>
+            <button data-action="refresh" class="text-xs px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium shadow-md shadow-indigo-600/20 transition flex items-center gap-1.5 cursor-pointer">
+                <i class="fa-solid fa-rotate"></i> Refresh
+            </button>
+        </div>
+    </header>
+
+    <main class="max-w-7xl w-full mx-auto flex-1 space-y-3.5">
+        <div id="dataWarning" role="alert" class="hidden rounded-xl border border-amber-600 bg-amber-950 p-3 text-sm text-amber-200"></div>
+        <div class="glass-card rounded-xl p-3 flex flex-wrap items-center justify-between gap-2">
+            <span id="issuesSummary" class="text-xs text-slate-300">Waiting for container health…</span>
+            <button data-action="diagnostics" class="text-xs text-indigo-300 hover:underline">Diagnostics</button>
+        </div>
+        <!-- 4 TOP SYSTEM STATUS CARDS (Clickable for full hardware & inventory details) -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <!-- 1. CPU -->
+            <div role="button" tabindex="0" data-action="card" data-value="cpu" title="Click for CPU hardware, core topology & load details"
+                 class="glass-card rounded-xl p-3 flex flex-col justify-between cursor-pointer transition hover:border-amber-500/50 hover:bg-slate-800/60 active:scale-[0.99] group select-none">
+                <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+                    <span class="flex items-center gap-1.5 text-slate-300 group-hover:text-amber-300 transition">
+                        <i class="fa-solid fa-microchip text-amber-400"></i> Host CPU
+                    </span>
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-[11px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded" id="sysCpuCores">— Cores</span>
+                        <span class="text-[10px] text-slate-500 group-hover:text-amber-400 transition hidden sm:inline"><i class="fa-solid fa-arrow-up-right-from-square"></i></span>
+                    </div>
+                </div>
+                <div class="flex items-baseline justify-between my-1">
+                    <div class="text-2xl font-bold text-white metric-badge" id="sysCpu">- %</div>
+                    <span class="text-xs text-slate-400 font-mono">Load: <strong class="text-slate-200" id="sysLoad">-</strong></span>
+                </div>
+                <div>
+                    <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                        <div id="sysCpuBar" class="bg-amber-400 h-1.5 rounded-full progress-bar-smooth" style="width: 0%"></div>
+                    </div>
+                    <div class="text-[11px] text-slate-400 mt-1 flex justify-between">
+                        <span>Docker: <strong class="text-amber-300 font-mono" id="sysDockerCpu">-</strong></span>
+                        <span class="text-slate-500" id="sysDockerHostCpu">(-% host)</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. System RAM -->
+            <div role="button" tabindex="0" data-action="card" data-value="memory" title="Click for memory buffers, cache, active RSS & swap details"
+                 class="glass-card rounded-xl p-3 flex flex-col justify-between cursor-pointer transition hover:border-purple-500/50 hover:bg-slate-800/60 active:scale-[0.99] group select-none">
+                <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+                    <span class="flex items-center gap-1.5 text-slate-300 group-hover:text-purple-300 transition">
+                        <i class="fa-solid fa-memory text-purple-400"></i> Host RAM
+                    </span>
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-[11px] font-mono text-purple-400" id="sysRamPct">-%</span>
+                        <span class="text-[10px] text-slate-500 group-hover:text-purple-400 transition hidden sm:inline"><i class="fa-solid fa-arrow-up-right-from-square"></i></span>
+                    </div>
+                </div>
+                <div class="flex items-baseline justify-between my-1">
+                    <div class="text-2xl font-bold text-white metric-badge" id="sysRam">-</div>
+                    <span class="text-xs text-slate-400 font-mono" id="sysRamSub">of —</span>
+                </div>
+                <div>
+                    <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                        <div id="sysRamBar" class="bg-purple-400 h-1.5 rounded-full progress-bar-smooth" style="width: 0%"></div>
+                    </div>
+                    <div class="text-[11px] text-slate-400 mt-1 flex justify-between">
+                        <span>Docker: <strong class="text-purple-300 font-mono" id="sysDockerRam">-</strong></span>
+                        <span class="text-slate-500">Resident</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. System Storage -->
+            <div role="button" tabindex="0" data-action="card" data-value="storage" title="Click for physical drives, serial numbers, disk IDs & partitions"
+                 class="glass-card rounded-xl p-3 flex flex-col justify-between cursor-pointer transition hover:border-cyan-500/50 hover:bg-slate-800/60 active:scale-[0.99] group select-none">
+                <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+                    <span class="flex items-center gap-1.5 text-slate-300 group-hover:text-cyan-300 transition">
+                        <i class="fa-solid fa-hard-drive text-cyan-400"></i> Storage
+                    </span>
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-[11px] font-mono text-slate-400">System &amp; Data</span>
+                        <span class="text-[10px] text-slate-500 group-hover:text-cyan-400 transition hidden sm:inline"><i class="fa-solid fa-arrow-up-right-from-square"></i></span>
+                    </div>
+                </div>
+                <div class="space-y-1.5 my-0.5">
+                    <div>
+                        <div class="flex items-center justify-between text-xs">
+                            <span class="flex items-center gap-1.5">
+                                <i class="fa-solid fa-bolt text-[10px] text-cyan-400"></i>
+                                <span class="text-slate-200 font-medium">System (Root)</span>
+                            </span>
+                            <span id="sysNvmeStats" class="text-xs font-mono text-cyan-300 font-semibold">- / - (-%)</span>
+                        </div>
+                        <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden mt-0.5">
+                            <div id="sysNvmeBar" class="bg-gradient-to-r from-cyan-500 to-blue-500 h-1.5 rounded-full progress-bar-smooth" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between text-xs">
+                            <span class="flex items-center gap-1.5">
+                                <i class="fa-solid fa-database text-[10px] text-emerald-400"></i>
+                                <span class="text-slate-200 font-medium">Secondary (Data)</span>
+                            </span>
+                            <span id="sysDataStats" class="text-xs font-mono text-emerald-300 font-semibold">- / - (-%)</span>
+                        </div>
+                        <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden mt-0.5">
+                            <div id="sysDataBar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-1.5 rounded-full progress-bar-smooth" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 4. Containers & Uptime -->
+            <div role="button" tabindex="0" data-action="card" data-value="system" title="Click for OS distribution, kernel, uptime & Docker daemon details"
+                 class="glass-card rounded-xl p-3 flex flex-col justify-between cursor-pointer transition hover:border-emerald-500/50 hover:bg-slate-800/60 active:scale-[0.99] group select-none">
+                <div class="flex items-center justify-between text-slate-400 text-xs font-semibold uppercase tracking-wider">
+                    <span class="flex items-center gap-1.5 text-slate-300 group-hover:text-emerald-300 transition">
+                        <i class="fa-solid fa-cubes text-emerald-400"></i> Containers
+                    </span>
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-[11px] font-mono text-emerald-400" id="sysUptime">Uptime: -</span>
+                        <span class="text-[10px] text-slate-500 group-hover:text-emerald-400 transition hidden sm:inline"><i class="fa-solid fa-arrow-up-right-from-square"></i></span>
+                    </div>
+                </div>
+                <div class="flex items-baseline justify-between my-1">
+                    <div class="text-2xl font-bold text-white metric-badge"><span id="sysHealth" class="text-emerald-400">-</span> <span class="text-xs font-normal text-slate-400">active</span></div>
+                    <span class="text-xs font-mono text-slate-400">PIDs: <strong class="text-slate-200" id="sysPids">-</strong></span>
+                </div>
+                <div>
+                    <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                        <div id="sysHealthBar" class="bg-emerald-400 h-1.5 rounded-full progress-bar-smooth" style="width: 100%"></div>
+                    </div>
+                    <div class="text-[11px] text-slate-400 mt-1 flex justify-between">
+                        <span id="sysContainerStats">-</span>
+                        <span class="text-slate-500 font-mono" id="portIndicator">Port 8989</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Filter & Search Controls Bar -->
+        <div class="glass-card rounded-xl p-3 flex flex-col gap-2.5">
+            <div class="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
+                <div class="relative flex-1">
+                    <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-3 text-slate-400 text-sm"></i>
+                    <input type="text" id="searchInput"  placeholder="Search stacks, containers, ports, images or services..."
+                           class="w-full pl-10 pr-4 py-2 bg-slate-900/90 text-sm text-slate-200 placeholder-slate-500 rounded-xl border border-slate-700/60 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
+                </div>
+                <div class="flex flex-wrap items-center gap-2.5">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-slate-400 font-medium whitespace-nowrap">Sort:</span>
+                        <select id="sortBy"  class="bg-slate-900/90 text-xs text-slate-200 py-2 px-3 rounded-xl border border-slate-700/60 focus:outline-none focus:border-indigo-500 cursor-pointer">
+                            <option value="cpu">Highest CPU</option>
+                            <option value="mem">Highest RAM</option>
+                            <option value="containers">Most Containers</option>
+                            <option value="name">Name (A-Z)</option>
+                        </select>
+                    </div>
+                    <button data-action="expand" data-value="true" class="text-xs px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition whitespace-nowrap cursor-pointer">
+                        Expand All
+                    </button>
+                    <button data-action="expand" data-value="false" class="text-xs px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition whitespace-nowrap cursor-pointer">
+                        Collapse All
+                    </button>
+                </div>
+            </div>
+
+            <!-- Quick Filter Tags -->
+            <div class="flex flex-wrap items-center gap-2 pt-1 border-t border-slate-800/80">
+                <span class="text-xs text-slate-400 font-medium mr-1">Quick Filters:</span>
+                <button data-action="filter" data-value="issues" id="qf-issues" class="qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800 text-amber-300">Needs attention</button>
+                <button data-action="filter" data-value="all" id="qf-all" class="qf-btn text-xs px-3 py-1 rounded-lg bg-indigo-600 text-white font-medium transition cursor-pointer">
+                    All (<span id="count-all">0</span>)
+                </button>
+                <button data-action="filter" data-value="cpu" id="qf-cpu" class="qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition flex items-center gap-1 cursor-pointer">
+                    <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Active CPU (>0.5%)
+                </button>
+                <button data-action="filter" data-value="mem" id="qf-mem" class="qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition flex items-center gap-1 cursor-pointer">
+                    <span class="w-1.5 h-1.5 rounded-full bg-purple-400"></span> Heavy RAM (>250MB)
+                </button>
+                <button data-action="filter" data-value="ports" id="qf-ports" class="qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition flex items-center gap-1 cursor-pointer">
+                    <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span> With Ports
+                </button>
+                <button data-action="filter" data-value="secondary" id="qf-secondary" class="qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition flex items-center gap-1 cursor-pointer">
+                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Secondary Storage
+                </button>
+                <button data-action="filter" data-value="root" id="qf-root" class="qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition flex items-center gap-1 cursor-pointer">
+                    <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span> Root Storage Only
+                </button>
+            </div>
+        </div>
+
+        <div class="glass-card rounded-xl p-3">
+            <div class="flex justify-between text-xs text-slate-400"><span>Host CPU / RAM history</span><span id="historyStatus">Collecting samples…</span></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-2">
+                <div><span class="text-xs text-amber-300">CPU · 0–100%</span><svg id="cpuHistory" viewBox="0 0 400 60" role="img" aria-label="Host CPU utilization history" class="w-full h-16"></svg></div>
+                <div><span class="text-xs text-purple-300">RAM · 0–100%</span><svg id="memoryHistory" viewBox="0 0 400 60" role="img" aria-label="Host RAM utilization history" class="w-full h-16"></svg></div>
+            </div>
+        </div>
+        <!-- Stacks Container -->
+        <div id="stacksContainer" class="space-y-4"></div>
+    </main>
+
+    <!-- Details / Logs Modal -->
+    <div id="modalOverlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle" class="fixed inset-0 bg-black/85 backdrop-blur-md z-50 hidden flex items-center justify-center p-3 sm:p-4">
+        <div class="glass-card bg-slate-900 border border-slate-700 rounded-2xl max-w-5xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+            <div class="p-4 border-b border-slate-800 flex items-center justify-between">
+                <div class="flex items-center gap-3 min-w-0">
+                    <div id="modalIcon" class="w-10 h-10 rounded-xl bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-lg shrink-0">
+                        <i class="fa-solid fa-info"></i>
+                    </div>
+                    <div class="min-w-0">
+                        <h3 id="modalTitle" class="text-base font-bold text-white truncate">Container Details</h3>
+                        <p id="modalSubtitle" class="text-xs text-slate-400 truncate">Container ID &amp; status</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                    <button id="modalActionBtn" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition flex items-center gap-1 cursor-pointer">
+                        <i class="fa-solid fa-rotate"></i> Reload
+                    </button>
+                    <button data-action="close" class="w-8 h-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center transition cursor-pointer">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+            </div>
+            <div id="modalContent" class="p-5 overflow-y-auto max-h-[75vh] space-y-4">
+                <!-- Injected dynamically -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js" defer></script>
+</body>
+</html>
