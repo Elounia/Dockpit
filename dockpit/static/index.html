@@ -3,12 +3,18 @@
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dockpit</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+<link rel="alternate icon" type="image/x-icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <header class="app-header shell">
-    <h1>Dockpit <span class="muted">/ Overview</span></h1>
+    <div class="brand">
+        <img src="/static/icon.svg" alt="Dockpit Logo" class="brand-icon" width="28" height="28">
+        <h1>Dockpit <span class="muted">/ Overview</span></h1>
+    </div>
     <div class="header-actions">
         <button data-action="diagnostics" id="systemIndicator"><span class="state-dot" id="liveDot"></span><span id="statusText">Connecting…</span></button>
         <button data-action="auto" aria-label="Pause automatic refresh"><i id="toggleIcon" class="fa-solid fa-pause"></i><span id="toggleText">Pause</span></button>
@@ -20,31 +26,44 @@
     <div class="host-metrics-grid">
 <button class="summary-tile" data-action="card" data-value="cpu" aria-label="Host CPU details"><span class="muted">CPU</span><span class="big-value" id="sysCpu">—</span><span class="thin-bar"><span id="sysCpuBar"></span></span><span class="tile-sub" id="sysCpuCores">—</span></button>
 <button class="summary-tile" data-action="card" data-value="memory"><span class="muted">RAM</span><span class="big-value" id="sysRam">—</span><span class="thin-bar"><span id="sysRamBar"></span></span><span class="tile-sub" id="sysRamSub">—</span></button>
-<button class="summary-tile" data-action="card" data-value="storage"><span class="muted">Storage</span><span class="big-value" id="sysNvmeStats">—</span><span class="thin-bar"><span id="sysNvmeBar"></span></span><span class="tile-sub" id="storageSub">—</span></button>
+<button class="summary-tile" data-action="card" data-value="storage"><span class="muted">Storage</span><span class="big-value" id="sysNvmeStats">—</span><span class="thin-bar" id="sysNvmeWrap" title="System storage"><span id="sysNvmeBar"></span></span><span class="thin-bar" id="sysDataWrap" title="Secondary storage" hidden><span id="sysDataBar"></span></span><span class="tile-sub" id="storageSub">—</span></button>
 <button class="summary-tile" data-action="card" data-value="system"><span class="muted">Containers</span><span class="big-value" id="sysHealth">—</span><span class="thin-bar"><span id="sysHealthBar"></span></span><span class="tile-sub" id="sysUptime">—</span></button>
 <button class="summary-tile" data-action="card" data-value="gpu"><span class="muted">GPU</span><span class="big-value" id="sysGpu">—</span><span class="thin-bar"><span id="sysGpuBar"></span></span><span class="tile-sub" id="sysGpuName">—</span></button>
 </div>
+    <section class="history-panel" aria-label="Host resource history">
+        <div class="chart-heading"><span>Host activity <span class="chart-legend">CPU <span class="muted">/ RAM</span></span></span><div class="segmented chart-ranges" aria-label="History range"><button data-range="300" aria-pressed="true">5m</button><button data-range="900" aria-pressed="false">15m</button><button data-range="3600" aria-pressed="false">1h</button></div></div>
+        <div class="chart-wrap"><canvas id="hostHistory" role="img" aria-label="Host CPU and RAM resource history"></canvas><div id="historyTooltip" hidden></div></div>
+        <div class="chart-footer"><span id="historyStatus">Collecting samples…</span><span>Host CPU / RAM</span></div>
+    </section>
     <div class="toolbar">
         <input type="search" id="searchInput" aria-label="Search stacks and containers" placeholder="Search stacks and containers…">
-        <div class="segmented"><button data-action="filter" data-value="all" id="qf-all" class="qf-btn">All <span id="count-all">0</span></button><button data-action="filter" data-value="issues" id="qf-issues" class="qf-btn">Needs attention</button></div>
+        <div class="segmented quick-filters" role="group" aria-label="Container status"><button data-action="filter" data-value="all" id="qf-all" class="qf-btn">All <span id="count-all">0</span></button><button data-action="filter" data-value="running" id="qf-running" class="qf-btn">Running</button><button data-action="filter" data-value="stopped" id="qf-stopped" class="qf-btn">Stopped</button><button data-action="filter" data-value="issues" id="qf-issues" class="qf-btn">Needs attention</button></div>
         <label class="sort-label">Sort <select id="sortBy"><option value="cpu">Highest CPU</option><option value="mem">Highest RAM</option><option value="containers">Most containers</option><option value="name">Name</option></select></label>
-        <details class="filters"><summary>Filters</summary><div class="filter-popover">
-<button data-action="filter" data-value="cpu" id="qf-cpu" class="qf-btn">Active CPU (>0.5%)</button>
-<button data-action="filter" data-value="mem" id="qf-mem" class="qf-btn">Heavy RAM (>250 MB)</button>
-<button data-action="filter" data-value="ports" id="qf-ports" class="qf-btn">With ports</button>
-<button data-action="filter" data-value="secondary" id="qf-secondary" class="qf-btn">Secondary storage</button>
-<button data-action="filter" data-value="root" id="qf-root" class="qf-btn">Root storage</button>
+        <details class="filters"><summary>More filters</summary><div class="filter-popover">
+<button data-action="filter" data-value="paused" id="qf-paused" class="qf-btn">Paused</button>
+<button data-action="filter" data-value="starting" id="qf-starting" class="qf-btn">Starting / created</button>
+<button data-action="filter" data-value="ports" id="qf-ports" class="qf-btn">Published ports</button>
 </div></details>
+        <button data-action="organize">Organize stacks</button>
         <button data-action="expand" id="expandAll" aria-label="Expand all stacks" title="Expand all stacks">↕</button>
     </div>
-    <section class="history-panel" aria-label="Host resource history">
-        <div class="chart-heading"><span>Host activity <span class="chart-legend">CPU <span class="muted">/ RAM · 0–100%</span></span></span><div class="segmented chart-ranges" aria-label="History range"><button data-range="300" aria-pressed="true">5m</button><button data-range="900" aria-pressed="false">15m</button><button data-range="3600" aria-pressed="false">1h</button></div></div>
-        <div class="chart-wrap"><canvas id="hostHistory" role="img" aria-label="Host CPU and RAM, fixed scale from 0 to 100 percent"></canvas><div id="historyTooltip" hidden></div></div>
-        <div class="chart-footer"><span id="historyStatus">Collecting samples…</span><span>Host CPU / RAM · last hour</span></div>
-    </section>
-    <div class="list-heading"><span>Stacks</span><span>CPU</span><span>RAM</span><span></span></div>
+    <div class="list-heading"><span>Stack / Container</span><span>CPU</span><span>RAM</span><span></span><span></span></div>
     <div id="stacksContainer"></div>
 </main>
+<footer class="app-footer shell">
+    <div class="footer-left">
+        <img src="/static/icon.svg" alt="" class="footer-icon" width="16" height="16" aria-hidden="true">
+        <span>&copy; 2026 <a href="https://github.com/Elounia" target="_blank" rel="noopener noreferrer">Carl-Emil Berg</a></span>
+        <span class="footer-dot">&middot;</span>
+        <a href="https://github.com/Elounia/Dockpit/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a>
+    </div>
+    <div class="footer-right">
+        <a href="https://github.com/Elounia/Dockpit" target="_blank" rel="noopener noreferrer" class="footer-repo-link" title="Dockpit GitHub Repository">
+            <i class="fa-brands fa-github" aria-hidden="true"></i>
+            <span>GitHub</span>
+        </a>
+    </div>
+</footer>
     <!-- Details / Logs Modal -->
     <div id="modalOverlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle" class="fixed inset-0 bg-black/85 backdrop-blur-md z-50 hidden flex items-center justify-center p-3 sm:p-4">
         <div class="glass-card bg-slate-900 border border-slate-700 rounded-2xl max-w-5xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">

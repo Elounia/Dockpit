@@ -1,8 +1,13 @@
 # syntax=docker/dockerfile:1
-FROM python:3.12-alpine AS runtime
+ARG PYTHON_IMAGE=python:3.12-alpine
+FROM ${PYTHON_IMAGE} AS runtime
 
 WORKDIR /app
-RUN addgroup -g 1000 dockpit && adduser -u 1000 -G dockpit -s /bin/sh -D dockpit
+RUN if command -v useradd >/dev/null; then \
+      groupadd -g 1000 dockpit && useradd -u 1000 -g dockpit -s /bin/sh -M dockpit; \
+    else \
+      addgroup -g 1000 dockpit && adduser -u 1000 -G dockpit -s /bin/sh -D dockpit; \
+    fi
 COPY dockpit/ ./dockpit/
 COPY LICENSE README.md ./
 ENV PYTHONUNBUFFERED=1 \

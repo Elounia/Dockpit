@@ -1,0 +1,11 @@
+# Optional NVIDIA monitoring; requires NVIDIA Container Toolkit on the host.
+# docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+services:
+  dockpit:
+    build:
+      args:
+        PYTHON_IMAGE: python:3.12-slim
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility

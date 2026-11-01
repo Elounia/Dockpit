@@ -26,8 +26,9 @@ def main():
             row = app.fetch_single_container_stats(c, system['mem_total_bytes'], system['cpus'])
         row['ports'] = '0.0.0.0:8080->80/tcp'
         rows.append(row)
-    rows[0].update(cpu_perc=12.5, mem_used_bytes=64 * 1024**2, pids=3)
-    app.cached_data = app.aggregate_snapshot(rows, system, 'socket')
+    with patch.object(app, 'attach_container_gpu'):
+        rows[0].update(cpu_perc=12.5, mem_used_bytes=64 * 1024**2, pids=3)
+        app.cached_data = app.aggregate_snapshot(rows, system, 'socket')
     rows[0].update(gpu_perc=25, gpu_memory_bytes=256 * 1024**2, gpu_stats_available=True)
     app.history.extend([{'timestamp': time.time()-10, 'host_cpu': 10, 'host_memory': 25}, {'timestamp': time.time(), 'host_cpu': 20, 'host_memory': 30}])
     inspect = {'Name': '/broken', 'State': {'Status': 'running', 'OOMKilled': True, 'ExitCode': 137}, 'RestartCount': 2, 'Mounts': [{'Source': attack, 'Destination': attack, 'Type': 'bind'}], 'NetworkSettings': {'Networks': {attack: {'IPAddress': '172.18.0.2'}}}}
@@ -44,16 +45,57 @@ def main():
             page.on('request', lambda request: external.append(request.url) if not request.url.startswith('http://127.0.0.1:') else None)
             page.goto(f'http://127.0.0.1:{server.server_port}', wait_until='networkidle')
             page.set_default_timeout(10000)
-            assert page.locator('#issuesSummary').inner_text() == '2 need attention'
+            assert page.locator('#issuesSummary').inner_text() == '1 needs attention'
             assert page.locator('.container-row').count() == 0
             page.locator('#issuesSummary').click()
             assert page.locator('#qf-issues').get_attribute('aria-pressed') == 'true'
             page.locator('#qf-all').click()
-            assert not page.locator('#qf-cpu').is_visible()
+            assert page.locator('#qf-cpu, #qf-mem, #qf-secondary, #qf-root').count() == 0
+            page.get_by_role('button', name='Expand all stacks', exact=True).click()
+            page.locator('#qf-stopped').click()
+            assert page.locator('.container-row').count() == 1
+            assert page.locator('.container-row').get_attribute('data-value') == 'stopped'
+            assert page.locator('.container-row .state-dot.inactive').count() == 1
+            assert page.locator('#qf-stopped').inner_text() == 'Stopped (1)'
+            page.reload(wait_until='networkidle')
+            assert page.locator('#qf-stopped').get_attribute('aria-pressed') == 'true'
+            page.locator('#qf-running').click()
+            assert page.locator('.container-row').count() == 1
+            assert page.locator('.container-row').get_attribute('data-value') == 'broken'
+            page.locator('#qf-issues').click()
+            assert page.locator('.container-row').count() == 1
+            page.locator('#qf-all').click()
+            # Stopped-only stacks stay neutral, regardless of the previous exit code.
+            page.evaluate("() => { const stopped=latestData.stacks.demo.containers.find(c=>c.name==='stopped'); renderIssues({stacks:{demo:{containers:[stopped]}}}); }")
+            assert page.locator('#issuesSummary').inner_text() == 'No active issues'
+            assert 'attention' not in (page.locator('#issuesSummary').get_attribute('class') or '')
+            page.evaluate('renderIssues(dashboardData())')
+            assert page.evaluate("""() => {
+                const cases = [
+                    [{state:'exited',health:'exited'}, 'stopped', true],
+                    [{state:'exited',health:'exited'}, 'issues', false],
+                    [{state:'paused',health:'paused'}, 'paused', true],
+                    [{state:'created',health:'created'}, 'starting', true],
+                    [{state:'running',health:'starting'}, 'starting', true],
+                    [{state:'running',health:'unhealthy'}, 'running', true],
+                    [{state:'restarting',health:'restarting'}, 'issues', true],
+                    [{state:'dead',health:'dead'}, 'issues', true],
+                    [{ports:'80/tcp'}, 'ports', false],
+                    [{ports:'127.0.0.1:8080->80/tcp'}, 'ports', true],
+                ];
+                return cases.every(([c,filter,expected]) => matchesQuickFilter(c,filter) === expected);
+            }""")
+            assert not page.locator('#qf-ports').is_visible()
             page.locator('.filters summary').click()
             page.locator('#qf-ports').click()
             assert page.locator('.filters').get_attribute('open') is None
+            assert page.locator('.filters summary').inner_text() == 'Published ports'
             page.locator('#qf-all').click()
+            # Retired preference values must not silently filter out containers.
+            page.evaluate("() => { const prefs=JSON.parse(localStorage.getItem('dockpit.preferences')); prefs.filter='secondary'; localStorage.setItem('dockpit.preferences',JSON.stringify(prefs)); }")
+            page.reload(wait_until='networkidle')
+            assert page.locator('#qf-all').get_attribute('aria-pressed') == 'true'
+            page.get_by_role('button', name='Collapse all stacks', exact=True).click()
             page.locator('[data-range="900"]').click()
             assert page.evaluate('historyChart.range') == 900
             page.locator('[data-range="3600"]').click()
@@ -62,6 +104,18 @@ def main():
             page.locator('#hostHistory').hover()
             assert page.locator('#historyTooltip').is_visible()
             assert 'CPU' in page.locator('#historyTooltip').inner_text()
+            assert 'CPUs' in page.locator('#historyTooltip').inner_text()
+            assert 'GiB' in page.locator('#historyTooltip').inner_text()
+            assert page.evaluate("""() => {
+                const previous = historyChart.capacity;
+                historyChart.capacity = {cpu_threads:8, memory_bytes:16*1024**3};
+                historyChart.showTooltip({timestamp:Date.now()/1000,host_cpu:25,host_memory:50});
+                const measured = [historyChart.tooltipFields['cpu-value'].textContent, historyChart.tooltipFields['ram-value'].textContent, historyChart.tooltipFields['cpu-percent'].textContent];
+                historyChart.showTooltip({timestamp:Date.now()/1000,host_cpu:null,host_memory:null});
+                const missing = historyChart.tooltipFields['ram-value'].textContent;
+                historyChart.capacity = previous;
+                return measured.join('|') === '2.00 / 8 CPUs|8.0 / 16.0 GiB|25.0%' && missing === 'Unavailable';
+            }""")
             page.mouse.move(0,0)
             page.wait_for_timeout(350)
             assert page.evaluate('historyChart.frame') == 0
@@ -79,7 +133,7 @@ def main():
             assert page.locator('#stacksContainer').inner_text().count(attack) >= 2
             assert page.locator('#stacksContainer img').count() == 0
             assert page.evaluate('window.dockpitXss') is None
-            assert page.locator('#qf-issues').inner_text() == 'Needs attention (2)'
+            assert page.locator('#qf-issues').inner_text() == 'Needs attention (1)'
             assert page.locator('#hostHistory').evaluate('(el) => el.width > 0'), (errors, csp_errors)
             assert page.locator('#sysGpu').inner_text() == '42.0%'
             assert page.locator('.host-metrics-grid').evaluate('(el) => getComputedStyle(el).gridTemplateColumns.split(" ").length') == 5
@@ -125,6 +179,52 @@ def main():
             page.reload(wait_until='networkidle')
             assert page.locator('#sortBy').input_value() == 'name'
             assert page.locator('[data-action=logs]').count() == 2  # expansion persisted
+            # Bulk grouping, safe stack names, refresh persistence, and reset.
+            custom_stack = '<img src=x onerror="window.dockpitXss=2">'
+            page.get_by_role('button', name='Organize stacks', exact=True).click()
+            page.screenshot(path='/tmp/dockpit-stacks-desktop.png', full_page=True)
+            page.set_viewport_size({'width': 390, 'height': 844})
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Stack editor overflows on mobile'
+            page.screenshot(path='/tmp/dockpit-stacks-mobile.png', full_page=True)
+            page.set_viewport_size({'width': 1440, 'height': 1100})
+            page.locator('#stackSearch').fill('broken')
+            page.locator('[data-action=stack-select]').click()
+            assert page.locator('#stackSelection').inner_text() == '1 selected'
+            page.locator('#stackDestination').fill(custom_stack)
+            page.locator('[data-action=stack-assign]').click()
+            assert page.evaluate('dashboardData().total_stacks') == 2
+            assert custom_stack in page.locator('#stacksContainer h2').all_text_contents()
+            assert page.locator('#stacksContainer img').count() == 0
+            page.reload(wait_until='networkidle')
+            assert page.evaluate('dashboardData().total_stacks') == 2
+            page.get_by_role('button', name='Organize stacks', exact=True).click()
+            page.locator('#stackSearch').fill('broken')
+            page.locator('[data-action=stack-select]').click()
+            assert page.locator('#stackSelection').inner_text() == '1 selected'
+            assert 'Your choice' in page.locator('#stackChoices').inner_text()
+            page.locator('[data-action=stack-reset]').click()
+            assert page.evaluate('dashboardData().total_stacks') == 1
+            page.get_by_role('button', name='Organize stacks', exact=True).click()
+            page.locator('[data-action=stack-select]').click()
+            page.locator('#stackDestination').fill('Games')
+            page.locator('[data-action=stack-assign]').click()
+            assert page.locator('#stacksContainer h2').all_text_contents() == ['Games']
+            assert page.locator('[data-action=logs]').count() == 2
+            assert page.evaluate("dashboardData().stacks.Games.total_cpu") == 12.5
+            assert page.evaluate("dashboardData().stacks.Games.total_mem_bytes") == 64 * 1024**2
+            assert page.evaluate("dashboardData().stacks.Games.total_pids") == 3
+            assert page.evaluate("dashboardData().stacks.Games.total_containers") == 2
+            assert page.evaluate('window.dockpitXss') is None
+            # A failed storage write keeps the previous organization intact.
+            page.get_by_role('button', name='Organize stacks', exact=True).click()
+            page.locator('[data-action=stack-select]').click()
+            page.locator('#stackDestination').fill('Unsaved')
+            page.evaluate("() => { Storage.prototype.setItem = () => { throw new Error('disabled'); }; }")
+            page.locator('[data-action=stack-assign]').click()
+            assert 'Could not save' in page.locator('#stackFeedback').inner_text()
+            page.locator('[data-action=close]').click()
+            assert page.locator('#stacksContainer h2').all_text_contents() == ['Games']
+            page.reload(wait_until='networkidle')
             app.cached_data['timestamp'] = time.time() - 120
             page.locator('[data-action=refresh]').click()
             page.wait_for_function("() => document.getElementById('statusText').textContent.startsWith('Stale')")

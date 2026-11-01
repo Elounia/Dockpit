@@ -25,6 +25,7 @@ from collections import deque
 from contextlib import closing
 from . import __version__
 from .history import HostSampler, TieredHistory
+from .gpu import get_gpu_metrics, attach_container_gpu
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -535,6 +536,7 @@ def get_system_metrics():
         except Exception:
             pass
 
+    gpu = get_gpu_metrics(ROOT_DIR)
     # Detailed hardware inventories for modal popups
     details = {
         "cpu": get_cpu_hardware_details(),
@@ -549,6 +551,7 @@ def get_system_metrics():
     return {
         "cpus": cpus,
         "host_cpu_pct": round(host_cpu_pct, 1) if host_cpu_pct is not None else None,
+        "gpu": gpu,
         "availability": {"cpu": host_cpu_pct is not None, "memory": memory_available, "storage": root_total is not None},
         "load": [round(l1, 2), round(l5, 2), round(l15, 2)],
         "load_str": f"{l1:.2f}, {l5:.2f}, {l15:.2f}",
@@ -605,7 +608,9 @@ def container_metadata(c):
     return {
         "id": c["Id"][:12], "full_id": c["Id"], "name": name,
         "display_name": labels.get("dockpit.name", name)[:120], "url": url, "icon": icon,
-        "stack": labels.get("com.docker.compose.project") or "Standalone",
+        "stack": labels.get("dockpit.stack", "").strip()[:120] or labels.get("com.docker.compose.project") or labels.get("com.docker.stack.namespace") or "Standalone",
+        "stack_source": "label" if labels.get("dockpit.stack", "").strip() else "compose" if labels.get("com.docker.compose.project") else "swarm" if labels.get("com.docker.stack.namespace") else "standalone",
+        "compose_project": labels.get("com.docker.compose.project", ""),
         "image": c.get("Image", ""), "state": c.get("State", "unknown"),
         "status": c.get("Status", ""), "created": c.get("Status", ""),
         "health": container_health(c.get("State"), c.get("Status", "")),
@@ -657,6 +662,8 @@ def fetch_single_container_stats(c, host_mem_bytes, cpus):
 
 
 def aggregate_snapshot(rows, system, backend):
+    attach_container_gpu(rows, system.get("gpu", {}), PROC_DIR)
+    group_standalone_containers(rows)
     stacks = {}
     for row in rows:
         stack = stacks.setdefault(row["stack"], {"name": row["stack"], "containers": [], "total_cpu": 0, "total_mem_bytes": 0, "total_pids": 0, "healthy_count": 0, "total_containers": 0})
@@ -676,7 +683,7 @@ def aggregate_snapshot(rows, system, backend):
         stack["total_mem_formatted"] = format_bytes(stack["total_mem_bytes"])
         stack["host_mem_perc"] = round(stack["total_mem_bytes"] / host_memory * 100, 2) if host_memory else None
         stack["docker_mem_share"] = round(stack["total_mem_bytes"] / memory * 100, 1) if memory else 0
-        stack["containers"].sort(key=lambda r: (r["health"] not in ("unhealthy", "exited", "dead", "restarting"), -r["cpu_perc"]))
+        stack["containers"].sort(key=lambda r: (r["health"] not in ("unhealthy", "dead", "restarting"), -r["cpu_perc"]))
     return {
         "timestamp": time.time(), "system": system, "backend": backend,
         "docker_total_cpu": cpu, "docker_host_cpu_perc": host_cpu,
@@ -690,6 +697,33 @@ def aggregate_snapshot(rows, system, backend):
         "total_containers": len(rows), "total_stacks": len(stacks),
         "total_pids": sum(r["pids"] for r in rows), "stacks": stacks,
     }
+
+
+def group_standalone_containers(rows):
+    """Group unassigned containers by image repository, preserving explicit stacks."""
+    images = {}
+    for row in rows:
+        if row.get("stack_source") != "standalone":
+            continue
+        image = row.get("image", "").lower().split("@", 1)[0]
+        # Strip tags without stripping a registry's port. IDs have no repository.
+        repository = image.rsplit("/", 1)[-1].split(":", 1)[0]
+        if not repository or image.startswith("sha256:") or re.fullmatch(r"[a-f0-9]{12,64}", repository):
+            continue
+        image = image.rsplit("/", 1)[0] + "/" + repository if "/" in image else repository
+        image = image.removeprefix("docker.io/").removeprefix("index.docker.io/")
+        image = image.removeprefix("library/")
+        images.setdefault(image, []).append(row)
+    reserved = {row["stack"] for row in rows if row.get("stack_source") != "standalone"}
+    for image, members in images.items():
+        if len(members) < 2 and image != "cubecoders/ampbase":
+            continue
+        name = "AMP" if image == "cubecoders/ampbase" else image
+        # Inference must not silently join an explicitly assigned stack.
+        while name in reserved:
+            name = "Image: " + name
+        for row in members:
+            row.update(stack=name, stack_source="image")
 
 
 def _fetch_docker_metrics_socket():
@@ -981,11 +1015,23 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path, params = parsed.path, parse_qs(parsed.query)
         if path in ("/", "/index.html"):
-            self.send_body(HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            self.send_body((STATIC_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
             return
+        if path == "/favicon.ico":
+            target = STATIC_DIR / "favicon.ico"
+            if target.is_file():
+                self.send_body(target.read_bytes(), "image/x-icon")
+                return
         if path.startswith("/static/"):
             target = (STATIC_DIR / path[len("/static/"):]).resolve()
-            types = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".woff2": "font/woff2"}
+            types = {
+                ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".woff2": "font/woff2",
+                ".svg": "image/svg+xml",
+                ".png": "image/png",
+                ".ico": "image/x-icon",
+            }
             if STATIC_DIR.resolve() not in target.parents or not target.is_file() or target.suffix not in types:
                 self.send_json({"error": "Not found"}, 404)
                 return
@@ -1014,7 +1060,9 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
                 # A restart can put the client's cursor ahead of the new history.
                 reset = bool(points and since > points[-1]["timestamp"])
                 self.send_json({"retention_seconds": 3600, "points": [p for p in points if reset or p["timestamp"] > since],
-                                "reset": reset, "cursor": points[-1]["timestamp"] if points else 0})
+                                "reset": reset, "cursor": points[-1]["timestamp"] if points else 0,
+                                "capacity": {"cpu_threads": data.get("system", {}).get("cpus") or os.cpu_count() or 1,
+                                             "memory_bytes": sampled_host.get("mem_total_bytes") or data.get("system", {}).get("mem_total_bytes") or None}})
             elif path == "/api/diagnostics":
                 diagnostic_data = {**data, "system": {**data.get("system", {}), **({"host_cpu_pct": sampled_host.get("host_cpu"), "mem_pct": sampled_host.get("host_memory")} if sampled_host else {})}}
                 self.send_json(diagnostics_payload(diagnostic_data, status, stale, points))

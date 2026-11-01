@@ -2,6 +2,9 @@
 
 ## Unreleased — 2026-11-01
 
+- Mount frontend assets read-only and serve HTML per request so edits appear on refresh without rebuilding.
+- Show used/total RAM and equivalent logical CPUs alongside percentages in history tooltips.
+
 - Redesign the overview with neutral surfaces, compact resource tiles and a single health status line.
 - Show stacks as flat CPU/RAM rows; expand containers and open details or logs in a side drawer.
 - Consolidate toolbar filters and merge freshness and diagnostics into an actionable system-status checklist.

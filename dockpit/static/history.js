@@ -6,12 +6,15 @@ class HostHistoryChart {
         this.status = status;
         this.points = [];
         this.cursor = 0;
+        this.capacity = {};
         this.range = 300;
         this.pending = false;
         this.frame = 0;
         this.timer = null;
         this.abort = null;
         this.hover = null;
+        tooltip.innerHTML = '<time class="history-time"></time><div class="history-tooltip-row"><span class="history-cpu-label">CPU</span><strong class="history-cpu-value"></strong><span class="history-cpu-percent"></span></div><div class="history-tooltip-row"><span>RAM</span><strong class="history-ram-value"></strong><span class="history-ram-percent"></span></div>';
+        this.tooltipFields = Object.fromEntries(['time','cpu-value','cpu-percent','ram-value','ram-percent'].map(key => [key, tooltip.querySelector(`.history-${key}`)]));
         canvas.addEventListener('pointermove', event => {
             const bounds = canvas.getBoundingClientRect();
             this.hover = Math.max(8, Math.min(bounds.width - 8, event.clientX - bounds.left));
@@ -24,7 +27,27 @@ class HostHistoryChart {
     setRange(seconds) {
         this.range = seconds;
         document.querySelectorAll('[data-range]').forEach(el => el.setAttribute('aria-pressed', Number(el.dataset.range) === seconds));
+        this.updateStatus();
         this.draw();
+    }
+    updateStatus() {
+        const rangeLabels = { 300: '5 minutes', 900: '15 minutes', 3600: '1 hour' };
+        const label = rangeLabels[this.range] || `${Math.round(this.range / 60)}m`;
+        if (!this.points.length) {
+            this.status.textContent = `Collecting samples… (range: ${label})`;
+            return;
+        }
+        const earliest = this.points[0].timestamp;
+        const latest = Math.max(Date.now() / 1000, this.points[this.points.length - 1].timestamp);
+        const dataSpan = latest - earliest;
+        if (dataSpan < this.range) {
+            const mins = Math.floor(dataSpan / 60);
+            const secs = Math.round(dataSpan % 60);
+            const spanText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+            this.status.textContent = `Last ${spanText} · range ${label}`;
+        } else {
+            this.status.textContent = `Showing last ${label}`;
+        }
     }
     start() {
         this.stop();
@@ -71,11 +94,12 @@ class HostHistoryChart {
             const data = await response.json();
             if (document.hidden || abort.signal.aborted) return;
             if (data.reset) this.points = [];
+            this.capacity = data.capacity || {};
             const arrived = data.points.length > 0;
             this.points.push(...data.points);
             this.cursor = data.cursor;
             this.compact();
-            this.status.textContent = `${this.points.length} samples · 1s / 10s resolution`;
+            this.updateStatus();
             if (arrived) this.animate();
         } catch (error) {
             if (error.name !== 'AbortError') this.status.textContent = 'History unavailable';
@@ -112,6 +136,23 @@ class HostHistoryChart {
             context.bezierCurveTo(a.x+dx,a.y+dx*tangents[i],b.x-dx,b.y-dx*tangents[i+1],b.x,b.y);
         }
     }
+    showTooltip(point) {
+        const percent = value => Number.isFinite(value) ? `${value.toFixed(1)}%` : 'Unavailable';
+        const threads = this.capacity.cpu_threads, memory = this.capacity.memory_bytes;
+        const cpu = Number.isFinite(point.host_cpu) && threads > 0 ? `${(point.host_cpu / 100 * threads).toFixed(2)} / ${threads} CPUs` : 'Unavailable';
+        let ram = 'Unavailable';
+        if (Number.isFinite(point.host_memory) && memory > 0) {
+            const unit = memory >= 1024 ** 3 ? 1024 ** 3 : 1024 ** 2;
+            const label = unit === 1024 ** 3 ? 'GiB' : 'MiB';
+            ram = `${(point.host_memory / 100 * memory / unit).toFixed(1)} / ${(memory / unit).toFixed(1)} ${label}`;
+        }
+        this.tooltipFields.time.textContent = new Date(point.timestamp * 1000).toLocaleTimeString();
+        this.tooltipFields['cpu-value'].textContent = cpu;
+        this.tooltipFields['cpu-value'].title = 'Equivalent logical CPUs in use; 100% uses all logical CPUs.';
+        this.tooltipFields['cpu-percent'].textContent = percent(point.host_cpu);
+        this.tooltipFields['ram-value'].textContent = ram;
+        this.tooltipFields['ram-percent'].textContent = percent(point.host_memory);
+    }
     draw(progress=1) {
         if (document.hidden) return;
         const canvas = this.canvas, width = canvas.clientWidth, height = canvas.clientHeight;
@@ -122,47 +163,216 @@ class HostHistoryChart {
         const context = canvas.getContext('2d');
         context.setTransform(ratio,0,0,ratio,0,0);
         context.clearRect(0,0,width,height);
-        const left=8, right=width-8, top=8, bottom=height-8;
-        const end=Date.now()/1000, start=end-this.range;
-        context.strokeStyle='rgba(255,255,255,.06)'; context.lineWidth=1;
-        for (const pct of [25,50,75]) { const y=bottom-pct/100*(bottom-top); context.beginPath(); context.moveTo(left,y); context.lineTo(right,y); context.stroke(); }
+
+        const left = 8, right = width - 8;
+        const now = Date.now() / 1000;
+        let start, end, windowDuration;
+
+        if (!this.points.length) {
+            windowDuration = Math.max(60, this.range);
+            start = now - windowDuration;
+            end = now;
+        } else {
+            const earliest = this.points[0].timestamp;
+            const latest = Math.max(now, this.points[this.points.length - 1].timestamp);
+            const dataSpan = latest - earliest;
+            windowDuration = Math.min(this.range, Math.max(60, dataSpan));
+            if (dataSpan >= this.range) {
+                // Once history reaches the selected range, scroll smoothly
+                start = latest - this.range;
+                end = latest;
+                windowDuration = this.range;
+            } else {
+                // Growing window: line always starts at left edge
+                start = earliest;
+                end = earliest + windowDuration;
+            }
+        }
+
         const visible = this.points.filter(p => p.timestamp >= start && p.timestamp <= end);
-        ['host_cpu','host_memory'].forEach((key,index) => {
-            let segment=[];
-            const flush=() => {
-                if (!segment.length) return;
-                context.beginPath(); this.curve(context,segment);
-                context.strokeStyle=index ? '#858791' : '#818cf8'; context.lineWidth=index ? 1.25 : 2;
-                context.lineJoin='round'; context.lineCap='round'; context.stroke();
-                if (!index && segment.length > 1) {
-                    context.lineTo(segment[segment.length-1].x,bottom); context.lineTo(segment[0].x,bottom); context.closePath();
-                    const gradient=context.createLinearGradient(0,top,0,bottom); gradient.addColorStop(0,'rgba(129,140,248,.22)'); gradient.addColorStop(1,'rgba(129,140,248,0)');
-                    context.fillStyle=gradient; context.fill();
-                }
-                segment=[];
-            };
-            let previous=null;
-            visible.forEach((p,i) => {
-                const gap=previous && p.timestamp-previous.timestamp > (p.timestamp <= end-300 ? 25 : 3);
-                if (gap || !Number.isFinite(p[key])) flush();
-                if (Number.isFinite(p[key])) {
-                    let value=p[key];
-                    if (i===visible.length-1 && previous && Number.isFinite(previous[key]) && !gap) value=previous[key]+(value-previous[key])*progress;
-                    segment.push({x:left+(p.timestamp-start)/this.range*(right-left),y:bottom-Math.max(0,Math.min(100,value))/100*(bottom-top)});
-                }
-                previous=p;
-            });
-            flush();
+
+        // Display-only smoothing for CPU (3-sample moving average)
+        const smoothedCpu = visible.map((p, i) => {
+            if (!Number.isFinite(p.host_cpu)) return null;
+            let sum = p.host_cpu;
+            let count = 1;
+            if (i > 0 && Number.isFinite(visible[i - 1].host_cpu) && Math.abs(p.timestamp - visible[i - 1].timestamp) <= 3) {
+                sum += visible[i - 1].host_cpu;
+                count++;
+            }
+            if (i < visible.length - 1 && Number.isFinite(visible[i + 1].host_cpu) && Math.abs(visible[i + 1].timestamp - p.timestamp) <= 3) {
+                sum += visible[i + 1].host_cpu;
+                count++;
+            }
+            return sum / count;
         });
+
+        // CPU Auto-scaling ceiling: 10 / 25 / 50 / 100
+        let maxCpu = 0;
+        for (const val of smoothedCpu) {
+            if (val != null && val > maxCpu) maxCpu = val;
+        }
+        let cpuCeiling = 10;
+        if (maxCpu > 50) cpuCeiling = 100;
+        else if (maxCpu > 25) cpuCeiling = 50;
+        else if (maxCpu > 10) cpuCeiling = 25;
+        else cpuCeiling = 10;
+
+        // Proportions: CPU row is taller (~70%), RAM row is a slim strip
+        const cpuTop = 10;
+        const cpuHeight = Math.max(50, Math.round((height - 34) * 0.70));
+        const cpuBottom = cpuTop + cpuHeight;
+
+        const ramTop = cpuBottom + 10;
+        const ramBottom = height - 10;
+        const ramHeight = ramBottom - ramTop;
+
+        // CPU grid lines & ceiling label
+        context.strokeStyle = 'rgba(255,255,255,.05)';
+        context.lineWidth = 1;
+        const cpuSteps = cpuCeiling === 100 ? [25, 50, 75] : cpuCeiling === 50 ? [25] : cpuCeiling === 25 ? [10] : [5];
+        for (const step of cpuSteps) {
+            const y = cpuBottom - (step / cpuCeiling) * (cpuBottom - cpuTop);
+            context.beginPath(); context.moveTo(left, y); context.lineTo(right, y); context.stroke();
+        }
+        context.beginPath(); context.moveTo(left, cpuTop); context.lineTo(right, cpuTop); context.stroke();
+        context.beginPath(); context.moveTo(left, cpuBottom); context.lineTo(right, cpuBottom); context.stroke();
+
+        context.fillStyle = 'rgba(255,255,255,.35)';
+        context.font = '10px ui-monospace, SFMono-Regular, monospace';
+        context.fillText(`${cpuCeiling}%`, left + 4, cpuTop + 10);
+        context.fillText('CPU', left + 4, cpuBottom - 5);
+
+        // Render CPU Curve
+        let cpuSegment = [];
+        const flushCpu = () => {
+            if (!cpuSegment.length) return;
+            context.beginPath();
+            this.curve(context, cpuSegment);
+            context.strokeStyle = '#818cf8';
+            context.lineWidth = 1.75;
+            context.lineJoin = 'round';
+            context.lineCap = 'round';
+            context.stroke();
+
+            if (cpuSegment.length > 1) {
+                context.lineTo(cpuSegment[cpuSegment.length - 1].x, cpuBottom);
+                context.lineTo(cpuSegment[0].x, cpuBottom);
+                context.closePath();
+                const grad = context.createLinearGradient(0, cpuTop, 0, cpuBottom);
+                grad.addColorStop(0, 'rgba(129,140,248,.20)');
+                grad.addColorStop(1, 'rgba(129,140,248,0)');
+                context.fillStyle = grad;
+                context.fill();
+            }
+            cpuSegment = [];
+        };
+
+        let previousCpu = null;
+        visible.forEach((p, i) => {
+            const val = smoothedCpu[i];
+            const gap = previousCpu && p.timestamp - previousCpu.timestamp > (p.timestamp <= end - 300 ? 25 : 3);
+            if (gap || val == null) flushCpu();
+            if (val != null) {
+                let displayVal = val;
+                if (i === visible.length - 1 && previousCpu && previousCpu.val != null && !gap) {
+                    displayVal = previousCpu.val + (displayVal - previousCpu.val) * progress;
+                }
+                const x = left + ((p.timestamp - start) / windowDuration) * (right - left);
+                const y = cpuBottom - (Math.max(0, Math.min(cpuCeiling, displayVal)) / cpuCeiling) * (cpuBottom - cpuTop);
+                cpuSegment.push({ x, y });
+            }
+            previousCpu = { timestamp: p.timestamp, val };
+        });
+        flushCpu();
+
+        // RAM row grid & labels
+        context.strokeStyle = 'rgba(255,255,255,.05)';
+        context.beginPath(); context.moveTo(left, ramTop); context.lineTo(right, ramTop); context.stroke();
+        context.beginPath(); context.moveTo(left, ramBottom); context.lineTo(right, ramBottom); context.stroke();
+
+        const latestRamPoint = [...visible].reverse().find(p => Number.isFinite(p.host_memory));
+        const currentRam = latestRamPoint ? latestRamPoint.host_memory : null;
+        context.fillStyle = 'rgba(255,255,255,.35)';
+        context.font = '10px ui-monospace, SFMono-Regular, monospace';
+        context.fillText(currentRam != null ? `RAM ${currentRam.toFixed(1)}%` : 'RAM 0–100%', left + 4, ramTop + 10);
+
+        // Render RAM Curve
+        let ramSegment = [];
+        const flushRam = () => {
+            if (!ramSegment.length) return;
+            context.beginPath();
+            this.curve(context, ramSegment);
+            context.strokeStyle = '#858791';
+            context.lineWidth = 1.25;
+            context.lineJoin = 'round';
+            context.lineCap = 'round';
+            context.stroke();
+
+            if (ramSegment.length > 1) {
+                context.lineTo(ramSegment[ramSegment.length - 1].x, ramBottom);
+                context.lineTo(ramSegment[0].x, ramBottom);
+                context.closePath();
+                const grad = context.createLinearGradient(0, ramTop, 0, ramBottom);
+                grad.addColorStop(0, 'rgba(133,135,145,.18)');
+                grad.addColorStop(1, 'rgba(133,135,145,0)');
+                context.fillStyle = grad;
+                context.fill();
+            }
+            ramSegment = [];
+        };
+
+        let previousRam = null;
+        visible.forEach((p, i) => {
+            const val = p.host_memory;
+            const gap = previousRam && p.timestamp - previousRam.timestamp > (p.timestamp <= end - 300 ? 25 : 3);
+            if (gap || !Number.isFinite(val)) flushRam();
+            if (Number.isFinite(val)) {
+                let displayVal = val;
+                if (i === visible.length - 1 && previousRam && Number.isFinite(previousRam.val) && !gap) {
+                    displayVal = previousRam.val + (displayVal - previousRam.val) * progress;
+                }
+                const x = left + ((p.timestamp - start) / windowDuration) * (right - left);
+                const y = ramBottom - (Math.max(0, Math.min(100, displayVal)) / 100) * (ramBottom - ramTop);
+                ramSegment.push({ x, y });
+            }
+            previousRam = { timestamp: p.timestamp, val };
+        });
+        flushRam();
+
+        // Shared hover crosshair across both rows
         if (this.hover !== null && visible.length) {
-            const timestamp=start+(this.hover-left)/(right-left)*this.range;
-            const point=visible.reduce((best,p) => Math.abs(p.timestamp-timestamp)<Math.abs(best.timestamp-timestamp) ? p : best);
-            const x=left+(point.timestamp-start)/this.range*(right-left);
-            context.strokeStyle='rgba(255,255,255,.25)'; context.beginPath(); context.moveTo(x,top); context.lineTo(x,bottom); context.stroke();
-            const percent=value => Number.isFinite(value) ? `${value.toFixed(1)}%` : 'Unavailable';
-            this.tooltip.textContent=`${new Date(point.timestamp*1000).toLocaleTimeString()} · CPU ${percent(point.host_cpu)} · RAM ${percent(point.host_memory)}`;
-            this.tooltip.hidden=false;
-            this.tooltip.style.left=`${Math.max(0,Math.min(width-this.tooltip.offsetWidth,x+12))}px`;
-        } else this.tooltip.hidden=true;
+            const timestamp = start + ((this.hover - left) / (right - left)) * windowDuration;
+            const point = visible.reduce((best, p) => Math.abs(p.timestamp - timestamp) < Math.abs(best.timestamp - timestamp) ? p : best);
+            const x = left + ((point.timestamp - start) / windowDuration) * (right - left);
+
+            context.strokeStyle = 'rgba(255,255,255,.25)';
+            context.lineWidth = 1;
+            context.beginPath();
+            context.moveTo(x, cpuTop);
+            context.lineTo(x, ramBottom);
+            context.stroke();
+
+            if (Number.isFinite(point.host_cpu)) {
+                const cpuY = cpuBottom - (Math.max(0, Math.min(cpuCeiling, point.host_cpu)) / cpuCeiling) * (cpuBottom - cpuTop);
+                context.fillStyle = '#818cf8';
+                context.beginPath();
+                context.arc(x, cpuY, 3, 0, Math.PI * 2);
+                context.fill();
+            }
+            if (Number.isFinite(point.host_memory)) {
+                const ramY = ramBottom - (Math.max(0, Math.min(100, point.host_memory)) / 100) * (ramBottom - ramTop);
+                context.fillStyle = '#858791';
+                context.beginPath();
+                context.arc(x, ramY, 2.5, 0, Math.PI * 2);
+                context.fill();
+            }
+
+            this.showTooltip(point);
+            this.tooltip.hidden = false;
+            this.tooltip.style.left = `${Math.max(0, Math.min(width - this.tooltip.offsetWidth, x + 12))}px`;
+        } else {
+            this.tooltip.hidden = true;
+        }
     }
 }

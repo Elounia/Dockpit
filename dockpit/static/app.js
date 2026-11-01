@@ -16,10 +16,12 @@ function savePreferences() {
         expanded: [...expandedStacks], filter: activeQuickFilter,
         sort: document.getElementById('sortBy').value,
         search: document.getElementById('searchInput').value,
-    })); } catch { /* Storage can be disabled by the browser. */ }
+        stackAssignments: Object.fromEntries(stackAssignments),
+    })); return true; } catch { return false; /* Storage can be disabled by the browser. */ }
 }
 const preferences = loadPreferences();
 let latestData = null;
+const stackAssignments = new Map(Object.entries(preferences.stackAssignments || {}).filter(([name, stack]) => typeof stack === 'string' && stack.trim() && stack.length <= 120));
 let modalGeneration = 0;
 let modalPreviousFocus = null;
 let autoRefresh = true;
@@ -94,7 +96,7 @@ async function fetchStats(force = false) {
         const data = await res.json();
         latestData = data;
 
-        updateTopKPIs(data);
+        updateTopKPIs(dashboardData());
         renderDashboard();
 
         updateSystemIndicator(data);
@@ -125,11 +127,68 @@ function formatBytesNoDec(numBytes) {
     return Math.round(num) + ' B';
 }
 
+function cleanGpuName(rawName) {
+    if (!rawName) return '';
+    return rawName.replace(/\s*\[.*?\]/g, '').trim() || rawName;
+}
+
+function formatImageName(img) {
+    if (!img) return '—';
+    if (img.startsWith('sha256:')) return img.slice(7, 19);
+    if (/^[0-9a-f]{64}$/i.test(img)) return img.slice(0, 12);
+    if (img.includes('@sha256:')) {
+        const [repo, digest] = img.split('@sha256:');
+        return `${repo}:${digest.slice(0, 12)}`;
+    }
+    return img;
+}
+
+function renderPortChips(portsStr) {
+    if (!portsStr || !portsStr.trim()) {
+        return '<span class="muted text-xs">No published ports</span>';
+    }
+    const parts = portsStr.split(',').map(s => s.trim()).filter(Boolean);
+    const seen = new Set();
+    const chips = [];
+    for (const part of parts) {
+        const match = part.match(/(?:(?:[0-9.]+|\[[0-9a-f:]+\]):)?(\d+)->(\d+(?:\/\w+)?)/i);
+        if (match) {
+            const hostPort = match[1];
+            const containerPort = match[2];
+            const key = `${hostPort}->${containerPort}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const url = portUrl(hostPort);
+            chips.push(`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="port-chip" title="Open port ${hostPort}">${escapeHtml(hostPort)} &rarr; ${escapeHtml(containerPort)} <i class="fa-solid fa-arrow-up-right-from-square" style="font-size:9px"></i></a>`);
+        } else {
+            if (seen.has(part)) continue;
+            seen.add(part);
+            chips.push(`<span class="port-chip port-internal">${escapeHtml(part)}</span>`);
+        }
+    }
+    return chips.length ? chips.join(' ') : '<span class="muted text-xs">No published ports</span>';
+}
+
+function findContainer(name) {
+    const data = dashboardData();
+    if (!data || !data.stacks) return null;
+    for (const stack of Object.values(data.stacks)) {
+        for (const c of stack.containers || []) {
+            if (c.name === name || c.display_name === name) return c;
+        }
+    }
+    return null;
+}
+
 function updateTopKPIs(data) {
     const sys = data.system || {}, gpu = sys.gpu || {}, devices = gpu.devices || [];
-    const text = (id, value) => { document.getElementById(id).textContent = value; };
+    const text = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    };
     const bar = (id, value) => {
         const el = document.getElementById(id);
+        if (!el) return;
         el.style.width = `${Math.min(100, Math.max(0, value || 0))}%`;
         el.className = value >= 90 ? 'critical' : value >= 75 ? 'warning' : '';
     };
@@ -139,19 +198,46 @@ function updateTopKPIs(data) {
     text('sysRam', sys.mem_used_formatted || 'Unavailable');
     text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct == null ? '—' : sys.mem_pct.toFixed(1)}%`);
     bar('sysRamBar', sys.mem_pct);
+
     const disk = sys.root_disk || {};
+    const dataDisk = sys.data_disk;
     text('sysNvmeStats', disk.total_bytes == null ? 'Unavailable' : formatBytesNoDec(disk.used_bytes));
-    text('storageSub', `of ${formatBytesNoDec(disk.total_bytes)} · ${disk.pct ?? '—'}% used`);
     bar('sysNvmeBar', disk.pct);
+    const dataWrap = document.getElementById('sysDataWrap');
+    if (dataWrap) {
+        if (dataDisk && dataDisk.total_bytes) {
+            dataWrap.hidden = false;
+            bar('sysDataBar', dataDisk.pct);
+            const nvmeWrap = document.getElementById('sysNvmeWrap');
+            if (nvmeWrap) nvmeWrap.title = `Root: ${formatBytesNoDec(disk.used_bytes)} / ${formatBytesNoDec(disk.total_bytes)} (${disk.pct ?? 0}%)`;
+            dataWrap.title = `Data: ${formatBytesNoDec(dataDisk.used_bytes)} / ${formatBytesNoDec(dataDisk.total_bytes)} (${dataDisk.pct ?? 0}%)`;
+            text('storageSub', `Root ${disk.pct ?? '—'}% · Data ${dataDisk.pct ?? '—'}% of ${formatBytesNoDec(dataDisk.total_bytes)}`);
+        } else {
+            dataWrap.hidden = true;
+            text('storageSub', `of ${formatBytesNoDec(disk.total_bytes)} · ${disk.pct ?? '—'}% used`);
+        }
+    }
+
     const total = data.total_containers || 0, running = data.running_containers || 0;
     text('sysHealth', `${running} / ${total}`);
     text('sysUptime', `${data.total_stacks || 0} stacks · Up ${sys.uptime_str || '—'}`);
     text('count-all', total);
     bar('sysHealthBar', total ? running / total * 100 : 0);
-    document.getElementById('sysHealthBar').className = '';
-    text('sysGpu', gpu.utilization_pct != null ? `${gpu.utilization_pct.toFixed(1)}%` : devices.length ? devices.map(d => d.name).join(', ') : 'No GPU');
-    document.getElementById('sysGpu').classList.toggle('no-metrics', gpu.utilization_pct == null);
-    text('sysGpuName', gpu.utilization_pct != null ? devices.map(d => d.name).join(', ') : devices.length ? 'No usage data' : 'No GPU detected');
+    const healthBar = document.getElementById('sysHealthBar');
+    if (healthBar) healthBar.className = '';
+
+    const gpuNames = devices.map(d => cleanGpuName(d.name)).filter(Boolean).join(', ');
+    const gpuMain = gpu.utilization_pct != null ? `${gpu.utilization_pct.toFixed(1)}%` : gpuNames || 'No GPU';
+    text('sysGpu', gpuMain);
+    const sysGpuEl = document.getElementById('sysGpu');
+    if (sysGpuEl) {
+        sysGpuEl.title = gpuNames || (gpu.utilization_pct != null ? `${gpu.utilization_pct.toFixed(1)}%` : 'No GPU');
+        sysGpuEl.classList.toggle('no-metrics', gpu.utilization_pct == null);
+    }
+    const subText = gpu.utilization_pct != null ? gpuNames : devices.length ? 'No usage data' : 'No GPU detected';
+    text('sysGpuName', subText);
+    const sysGpuNameEl = document.getElementById('sysGpuName');
+    if (sysGpuNameEl) sysGpuNameEl.title = subText;
     bar('sysGpuBar', gpu.utilization_pct);
 }
 
@@ -167,7 +253,7 @@ function toggleStack(stackName) {
 function toggleExpandAll(expand) {
     if (!latestData || !latestData.stacks) return;
     if (expand) {
-        Object.keys(latestData.stacks).forEach(s => expandedStacks.add(s));
+        Object.keys(dashboardData().stacks).forEach(s => expandedStacks.add(s));
     } else {
         expandedStacks.clear();
     }
@@ -175,9 +261,10 @@ function toggleExpandAll(expand) {
 }
 
 function setQuickFilter(type) {
-    activeQuickFilter = type;
-    document.querySelectorAll('.qf-btn').forEach(btn => btn.setAttribute('aria-pressed', btn.dataset.value === type));
-    document.querySelector('.filters summary').textContent = ['all', 'issues'].includes(type) ? 'Filters' : 'Filters · 1';
+    activeQuickFilter = ['all', 'running', 'stopped', 'issues', 'paused', 'starting', 'ports'].includes(type) ? type : 'all';
+    document.querySelectorAll('.qf-btn').forEach(btn => btn.setAttribute('aria-pressed', btn.dataset.value === activeQuickFilter));
+    const extra = document.querySelector(`.filter-popover [data-value="${activeQuickFilter}"]`);
+    document.querySelector('.filters summary').textContent = extra ? extra.textContent : 'More filters';
     renderDashboard();
 }
 
@@ -248,8 +335,37 @@ function openTopCardModal(type) {
     }
 }
 
+function gpuPercent(value) {
+    return value == null ? 'Unavailable' : `${value.toFixed(1)}%`;
+}
+function gpuBytes(value) {
+    return value == null ? 'Unavailable' : formatBytesNoDec(value);
+}
+function renderGpuDetailsModal(gpu) {
+    const devices = gpu.devices || [];
+    const content = devices.map(d => `
+        <div class="bg-slate-950 p-3.5 rounded-xl border border-slate-800 space-y-2">
+            <h4 class="text-white font-bold">${d.name}</h4>
+            <div class="text-xs text-slate-400 font-mono">${d.vendor} · ${d.id}</div>
+            <div class="grid grid-cols-2 gap-3 text-sm text-slate-300">
+                <div>GPU load: <strong>${d.utilization_pct == null ? 'Not measured' : gpuPercent(d.utilization_pct)}</strong></div>
+                <div>${d.memory_kind === 'shared' ? 'Memory: <strong>Shared system RAM</strong>' : `VRAM: <strong>${gpuBytes(d.memory_used_bytes)} / ${gpuBytes(d.memory_total_bytes)}</strong>`}</div>
+                ${d.frequency_mhz == null ? '' : `<div>Current clock: <strong>${d.frequency_mhz.toFixed(0)} MHz</strong></div>`}
+                ${d.max_frequency_mhz == null ? '' : `<div>Configured max clock: <strong>${d.max_frequency_mhz.toFixed(0)} MHz</strong></div>`}
+                ${d.temperature_c == null ? '' : `<div>Temperature: <strong>${d.temperature_c.toFixed(1)} °C</strong></div>`}
+                ${d.power_w == null ? '' : `<div>Power: <strong>${d.power_w.toFixed(1)} W</strong></div>`}
+            </div>
+            ${d.utilization_pct == null && d.utilization_note ? `<p class="text-xs text-amber-300">${d.utilization_note}</p>` : ''}
+            ${d.memory_note ? `<p class="text-xs text-slate-400">${d.memory_note}</p>` : ''}
+        </div>`).join('') || '<p class="text-slate-400">No GPU detected. GPU measurements are unavailable.</p>';
+    const measured = devices.length && devices.every(d => d.utilization_pct != null);
+    openModal('Host GPU & memory', `${devices.length} graphics device(s) · ${measured ? 'utilization averaged across GPUs' : 'load measurements incomplete'}`,
+        content + '<p class="text-xs text-slate-400">Temperature and power appear when exposed by the device. Container GPU shows measured process activity and dedicated VRAM where supported.</p>',
+        'fa-microchip text-emerald-400', () => fetchStats(true).then(() => openTopCardModal('gpu')));
+}
+
 function renderCpuDetailsModal(sys, cpu) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     const hostCpu = (sys.host_cpu_pct == null ? 'Unavailable' : sys.host_cpu_pct.toFixed(1));
     const dockerTotal = (view.docker_total_cpu || 0).toFixed(1);
     const hostShare = ((dockerTotal / (sys.cpus || 1)) || 0).toFixed(1);
@@ -371,7 +487,7 @@ function renderCpuDetailsModal(sys, cpu) {
 }
 
 function renderMemoryDetailsModal(sys, mem) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     let allContainers = [];
     if (view.stacks) {
         Object.values(view.stacks).forEach(s => {
@@ -503,7 +619,7 @@ function renderMemoryDetailsModal(sys, mem) {
 }
 
 function renderStorageDetailsModal(sys, storage) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     const devices = storage.devices || [];
 
     let devicesHtml = '';
@@ -641,7 +757,7 @@ function renderStorageDetailsModal(sys, storage) {
 }
 
 function renderSystemDetailsModal(sys, docker) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     const runningCount = view.running_containers !== undefined ? view.running_containers : (view.total_containers || 0);
     const totalCount = view.total_containers || runningCount;
     const unhealthyCount = view.unhealthy_containers || 0;
@@ -743,8 +859,102 @@ function renderSystemDetailsModal(sys, docker) {
     );
 }
 
+function dashboardData() {
+    if (!latestData) return null;
+    const stacks = new Map();
+    for (const source of Object.values(latestData.stacks || {})) {
+        for (const original of source.containers || []) {
+            const name = stackAssignments.get(original.name) || original.stack || source.name;
+            const c = {...original, stack: name, stack_source: stackAssignments.has(original.name) ? 'manual' : original.stack_source};
+            if (!stacks.has(name)) stacks.set(name, {name, containers: [], total_cpu: 0, total_mem_bytes: 0, total_pids: 0, healthy_count: 0, total_containers: 0});
+            const stack = stacks.get(name);
+            stack.containers.push(c);
+            stack.total_cpu += c.cpu_perc || 0;
+            stack.total_mem_bytes += c.mem_used_bytes || 0;
+            stack.total_pids += c.pids || 0;
+            stack.healthy_count += ['healthy', 'running'].includes(c.health) ? 1 : 0;
+            stack.total_containers++;
+        }
+    }
+    for (const stack of stacks.values()) {
+        stack.total_mem_formatted = formatBytesNoDec(stack.total_mem_bytes);
+        stack.host_mem_perc = latestData.host_total_mem_bytes ? stack.total_mem_bytes / latestData.host_total_mem_bytes * 100 : 0;
+        stack.docker_mem_share = latestData.docker_total_mem_bytes ? Math.round(stack.total_mem_bytes / latestData.docker_total_mem_bytes * 100) : 0;
+    }
+    return {...latestData, stacks: Object.fromEntries(stacks), total_stacks: stacks.size};
+}
+
+function organizeStacks(preselect = '') {
+    if (!latestData) return;
+    const data = dashboardData();
+    const containers = Object.values(data.stacks).flatMap(s => s.containers).sort((a, b) => a.name.localeCompare(b.name));
+    const reasons = {label: 'Stack label', compose: 'Compose project', swarm: 'Swarm stack', image: 'Same image', standalone: 'No stack metadata', manual: 'Your choice'};
+    openModal('Organize stacks', 'Select containers, then choose an existing stack or create one.', `
+        <div class="space-y-3">
+            <p class="text-xs text-slate-400">Your choices are saved in this browser and survive container recreation with the same name. Use a dockpit.stack label to share a stack with everyone.</p>
+            <label class="block text-sm text-slate-300">Find containers
+                <input id="stackSearch" type="search" class="w-full mt-1 p-2 rounded-lg bg-slate-950 border border-slate-700" placeholder="Name, stack or image">
+            </label>
+            <div class="flex items-center gap-3 text-xs text-slate-300">
+                <button data-action="stack-select" class="px-3 py-2 rounded-lg bg-slate-800">Select visible</button>
+                <button data-action="stack-clear" class="px-3 py-2 rounded-lg bg-slate-800">Clear selection</button>
+                <span id="stackSelection" role="status"></span>
+            </div>
+            <div id="stackChoices" class="stack-choices border border-slate-800 rounded-xl divide-y divide-slate-800">
+                ${containers.map(c => `<label class="stack-choice flex items-center gap-3 p-3 cursor-pointer hover:bg-slate-800" data-search="${escapeHtml([c.name, c.stack, c.image].join(' ').toLowerCase())}">
+                    <input type="checkbox" value="${escapeHtml(c.name)}" ${c.name === preselect ? 'checked' : ''}>
+                    <span class="min-w-0"><strong class="block text-sm text-white break-all">${escapeHtml(c.name)}</strong>
+                    <span class="block text-xs text-slate-400 break-all">${escapeHtml(c.stack)} · ${reasons[c.stack_source] || 'Automatic'} · ${escapeHtml(c.image)}</span></span>
+                </label>`).join('')}
+            </div>
+            <label class="block text-sm text-slate-300">Destination stack
+                <input id="stackDestination" maxlength="120" list="stackNames" class="w-full mt-1 p-2 rounded-lg bg-slate-950 border border-slate-700" placeholder="Choose a stack or type a new name">
+                <datalist id="stackNames">${Object.keys(data.stacks).sort().map(name => `<option value="${escapeHtml(name)}"></option>`).join('')}</datalist>
+            </label>
+            <div class="flex flex-wrap gap-2">
+                <button data-action="stack-assign" class="px-3 py-2 text-sm rounded-lg bg-indigo-600 text-white">Move selected</button>
+                <button data-action="stack-reset" class="px-3 py-2 text-sm rounded-lg bg-slate-800 text-slate-300">Use automatic grouping</button>
+            </div>
+            <p id="stackFeedback" role="status" class="text-xs text-amber-300"></p>
+        </div>`, 'fa-layer-group text-indigo-400', () => organizeStacks());
+    const search = document.getElementById('stackSearch');
+    search.addEventListener('input', () => {
+        const q = search.value.trim().toLowerCase();
+        document.querySelectorAll('.stack-choice').forEach(row => { row.hidden = !row.dataset.search.includes(q); });
+    });
+    document.getElementById('stackChoices').addEventListener('change', updateStackSelection);
+    updateStackSelection();
+}
+
+function updateStackSelection() {
+    const count = document.querySelectorAll('#stackChoices input:checked').length;
+    document.getElementById('stackSelection').textContent = `${count} selected`;
+}
+
+function assignStack(reset = false) {
+    const selected = [...document.querySelectorAll('#stackChoices input:checked')];
+    const destination = document.getElementById('stackDestination').value.trim();
+    if (!selected.length || (!reset && !destination)) {
+        document.getElementById('stackFeedback').textContent = !selected.length ? 'Select at least one container.' : 'Enter a stack name.';
+        return;
+    }
+    const previous = new Map(stackAssignments);
+    selected.forEach(input => { if (reset) stackAssignments.delete(input.value); else stackAssignments.set(input.value, destination); });
+    // A saved organization should never silently disappear after a reload.
+    if (!savePreferences()) {
+        stackAssignments.clear();
+        previous.forEach((value, key) => stackAssignments.set(key, value));
+        document.getElementById('stackFeedback').textContent = 'Could not save. Allow browser storage and try again.';
+        return;
+    }
+    if (!reset) expandedStacks.add(destination);
+    renderDashboard();
+    updateTopKPIs(dashboardData());
+    closeModal();
+}
+
 function renderDashboard() {
-    const view = latestData;
+    const view = dashboardData();
     if (!latestData || !view.stacks) return;
 
     savePreferences();
@@ -762,6 +972,7 @@ function renderDashboard() {
         const matchingContainers = s.containers.filter(c => {
             const matchesSearch = matchesStack ||
                    c.name.toLowerCase().includes(q) ||
+                   (c.display_name || '').toLowerCase().includes(q) ||
                    c.image.toLowerCase().includes(q) ||
                    c.service.toLowerCase().includes(q) ||
                    (c.storage_tier && c.storage_tier.toLowerCase().includes(q)) ||
@@ -769,13 +980,7 @@ function renderDashboard() {
 
             if (!matchesSearch) return false;
 
-            if (activeQuickFilter === 'issues') return ['unhealthy', 'exited', 'dead', 'restarting'].includes(c.health);
-            if (activeQuickFilter === 'cpu') return c.cpu_perc >= 0.5;
-            if (activeQuickFilter === 'mem') return c.mem_used_bytes >= (250 * 1024 * 1024);
-            if (activeQuickFilter === 'ports') return Boolean(c.ports && c.ports.trim().length > 0);
-            if (activeQuickFilter === 'secondary') return Boolean(c.storage_tier && c.storage_tier.includes('Secondary'));
-            if (activeQuickFilter === 'root') return Boolean(c.storage_tier && c.storage_tier.includes('Root') && !c.storage_tier.includes('Secondary'));
-            return true;
+            return matchesQuickFilter(c, activeQuickFilter);
         });
 
         if (matchingContainers.length > 0) {
@@ -808,18 +1013,53 @@ function renderDashboard() {
         return;
     }
 
+    // Determine the heaviest visible row for bar scaling
+    let maxCpu = 0;
+    let maxMemBytes = 0;
+    const cpus = latestData.system?.cpus || 1;
+    const hostMemTotal = latestData.system?.mem_total_bytes || 1;
+
+    for (const stack of filtered) {
+        if (stack.total_cpu > maxCpu) maxCpu = stack.total_cpu;
+        if (stack.total_mem_bytes > maxMemBytes) maxMemBytes = stack.total_mem_bytes;
+        const isExp = (q && q.length > 0) || expandedStacks.has(stack.key);
+        if (isExp) {
+            for (const c of stack.displayContainers) {
+                if (c.cpu_perc > maxCpu) maxCpu = c.cpu_perc;
+                if (c.mem_used_bytes > maxMemBytes) maxMemBytes = c.mem_used_bytes;
+            }
+        }
+    }
+    if (maxCpu <= 0) maxCpu = 1;
+    if (maxMemBytes <= 0) maxMemBytes = 1;
+
+    const calcBarWidth = (val, max) => {
+        if (!val || val <= 0) return 0;
+        return Math.max(3, Math.min(100, (val / max) * 100));
+    };
+
     let html = '';
     for (const stack of filtered) {
         const isExpanded = (q && q.length > 0) || expandedStacks.has(stack.key);
-        const state = stack.containers.some(c => needsAttention(c)) ? 'warning' : stack.containers.every(c => ['healthy','running'].includes(c.health)) ? '' : 'warning';
+        const state = stack.containers.some(needsAttention) ? 'warning' : stack.containers.some(isRunning) ? '' : 'inactive';
+        const cpuBarWidth = calcBarWidth(stack.total_cpu, maxCpu);
+        const memBarWidth = calcBarWidth(stack.total_mem_bytes, maxMemBytes);
+        const hostCpuPct = stack.total_cpu / cpus;
+        const hostMemPct = stack.host_mem_perc || (stack.total_mem_bytes / hostMemTotal * 100);
+
         html += `<section class="stack-group">
             <div role="button" tabindex="0" aria-expanded="${Boolean(isExpanded)}" data-action="stack" data-value="${escapeHtml(stack.key)}" class="stack-row">
-                <div class="stack-name"><span class="state-dot ${state}"></span><h2>${escapeHtml(stack.name)}</h2><small>${stack.displayContainers.length} containers</small></div>
-                ${rowMetric(`${stack.total_cpu.toFixed(1)}%`, stack.total_cpu / (latestData.system?.cpus || 1))}
-                ${rowMetric(formatBytesNoDec(stack.total_mem_bytes), stack.host_mem_perc)}
-                <span class="muted" aria-hidden="true">${isExpanded ? '−' : '+'}</span>
+                <div class="stack-name">
+                    <span class="state-dot ${state}"></span>
+                    <h2 class="stack-title">${escapeHtml(stack.name)}</h2>
+                    <span class="stack-count">${stack.displayContainers.length} containers</span>
+                </div>
+                ${rowMetric(`${stack.total_cpu.toFixed(1)}%`, cpuBarWidth, hostCpuPct, hostCpuPct > 25)}
+                ${rowMetric(formatBytesNoDec(stack.total_mem_bytes), memBarWidth, hostMemPct, hostMemPct > 25)}
+                <div></div>
+                <span class="stack-chevron" aria-hidden="true"><i class="fa-solid fa-chevron-right"></i></span>
             </div>
-            ${isExpanded ? `<div>${stack.displayContainers.map(c => renderContainerRow(c, stack)).join('')}</div>` : ''}
+            ${isExpanded ? `<div>${stack.displayContainers.map(c => renderContainerRow(c, maxCpu, maxMemBytes)).join('')}</div>` : ''}
         </section>`;
     }
     const allExpanded = Object.keys(view.stacks).every(key => expandedStacks.has(key));
@@ -831,35 +1071,123 @@ function renderDashboard() {
     containerEl.innerHTML = html;
 }
 
-function needsAttention(c) { return ['unhealthy','exited','dead','restarting'].includes(c.health); }
-function rowMetric(label, percent) {
-    const pct = Math.max(0, Math.min(100, percent || 0));
-    return `<div class="row-metric"><span>${escapeHtml(label)}</span><span class="thin-bar"><span class="${pct >= 90 ? 'critical' : pct >= 75 ? 'warning' : ''}" style="width:${pct}%"></span></span></div>`;
+// Stopped containers may be retired, manually stopped, or completed jobs.
+// A stop alone does not establish a failure or an expectation to keep running.
+function needsAttention(c) { return ['unhealthy','dead','restarting'].includes(c.health); }
+function isRunning(c) { return c.state === 'running' || (!c.state && ['healthy','running','unhealthy','starting'].includes(c.health)); }
+function isStopped(c) { return (c.state || c.health) === 'exited'; }
+function matchesQuickFilter(c, filter) {
+    if (filter === 'issues') return needsAttention(c);
+    if (filter === 'running') return isRunning(c);
+    if (filter === 'stopped') return isStopped(c);
+    if (filter === 'paused') return (c.state || c.health) === 'paused';
+    if (filter === 'starting') return c.health === 'starting' || (c.state || c.health) === 'created';
+    if (filter === 'ports') return /->/.test(c.ports || '');
+    return true;
 }
-function renderContainerRow(container) {
+function rowMetric(label, barWidthPct, hostPct, isHigh) {
+    const width = Math.max(0, Math.min(100, barWidthPct || 0));
+    const hostText = Number.isFinite(hostPct) ? `${hostPct.toFixed(1)}% of host` : '';
+    const tooltip = hostText ? `${label} (${hostText})` : label;
+    const barClass = isHigh ? 'warning' : '';
+    return `<div class="row-metric" title="${escapeHtml(tooltip)}"><span>${escapeHtml(label)}</span><span class="thin-bar"><span class="${barClass}" style="width:${width}%"></span></span></div>`;
+}
+function renderContainerRow(container, maxCpu, maxMemBytes) {
     const c = escapedView(container);
-    const ports = (container.ports || '').split(',').filter(Boolean).map(port => {
-        const match = port.match(/(?:^|:)(\d+)->/);
-        return match ? `<a href="${escapeHtml(portUrl(match[1]))}" target="_blank" rel="noopener noreferrer">${escapeHtml(port.trim())}</a>` : escapeHtml(port);
-    }).join(' · ');
-    return `<div class="container-row" role="button" tabindex="0" data-action="inspect" data-value="${c.name}">
-        <div class="container-main"><span class="stack-name"><span class="state-dot ${needsAttention(container) ? 'warning' : ''}"></span><strong>${c.display_name || c.name}</strong><span class="muted">${c.health}</span></span>
-        <span class="row-metric">${c.cpu_perc.toFixed(1)}% CPU · ${c.mem_used_formatted || '0 B'} RAM</span>
-        <button data-action="logs" data-value="${c.name}">Logs</button></div>
-        <div class="container-meta"><span>${c.image}</span>${ports ? `<span>${ports}</span>` : ''}<span>Network ↓ ${c.net_rx || '—'} ↑ ${c.net_tx || '—'}</span>
-        ${c.gpu_stats_available ? `<span>GPU ${(c.gpu_perc == null ? 'Unavailable' : c.gpu_perc.toFixed(1) + '%')} · VRAM ${(c.gpu_memory_bytes == null ? 'Unavailable' : formatBytesNoDec(c.gpu_memory_bytes))}</span>` : ''}
-        ${c.url ? `<a href="${c.url}" target="_blank" rel="noopener noreferrer">Open app</a>` : ''}</div>
+    const cpus = latestData.system?.cpus || 1;
+    const hostMemTotal = latestData.system?.mem_total_bytes || 1;
+    const cCpuBarWidth = container.cpu_perc > 0 ? Math.max(3, Math.min(100, (container.cpu_perc / maxCpu) * 100)) : 0;
+    const cMemBarWidth = container.mem_used_bytes > 0 ? Math.max(3, Math.min(100, (container.mem_used_bytes / maxMemBytes) * 100)) : 0;
+    const cHostCpuPct = container.cpu_perc / cpus;
+    const cHostMemPct = (container.mem_used_bytes / hostMemTotal) * 100;
+
+    return `<div class="container-row" role="button" tabindex="0" data-action="inspect" data-value="${escapeHtml(c.name)}">
+        <div class="container-col-name">
+            <span class="state-dot ${needsAttention(container) ? 'warning' : isRunning(container) ? '' : 'inactive'}"></span>
+            <strong class="container-title">${escapeHtml(c.display_name || c.name)}</strong>
+            <span class="container-state-label">${escapeHtml(isStopped(container) ? 'stopped' : (c.health || c.state || ''))}</span>
+        </div>
+        ${rowMetric(`${c.cpu_perc.toFixed(1)}%`, cCpuBarWidth, cHostCpuPct, cHostCpuPct > 25)}
+        ${rowMetric(c.mem_used_formatted || '0 B', cMemBarWidth, cHostMemPct, cHostMemPct > 25)}
+        <div></div>
+        <span class="container-drawer-trigger" aria-hidden="true">&rsaquo;</span>
     </div>`;
 }
 
 async function inspectContainer(name) {
-    openModal(
-        `Container Details: ${name}`,
-        'Fetching secure inspection data from Docker...',
-        '<div class="text-center py-8 text-slate-400"><i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500 mb-2"></i><p>Loading configuration...</p></div>',
-        'fa-circle-info text-indigo-400',
-        () => inspectContainer(name)
-    );
+    const c = findContainer(name);
+    const displayName = c ? (c.display_name || c.name) : name;
+    const title = displayName;
+    const subtitle = c ? `${c.stack} · ${isStopped(c) ? 'Stopped' : (c.health || c.state || 'Running')}` : 'Container details';
+
+    const formattedImage = c ? formatImageName(c.image) : '—';
+    const portsHtml = c ? renderPortChips(c.ports) : '<span class="muted text-xs">No ports published</span>';
+    const netRx = c?.net_rx || '—';
+    const netTx = c?.net_tx || '—';
+    const cpuStr = c ? `${c.cpu_perc.toFixed(1)}%` : '—';
+    const ramStr = c ? (c.mem_used_formatted || '0 B') : '—';
+
+    const initialContent = `
+        <div class="space-y-3">
+            <div class="drawer-section">
+                <div class="flex items-center justify-between mb-3">
+                    <span class="drawer-section-title"><i class="fa-solid fa-gauge-high text-indigo-400"></i> Status &amp; Performance</span>
+                    <button data-action="logs" data-value="${escapeHtml(name)}" class="drawer-btn-logs"><i class="fa-solid fa-terminal text-cyan-400"></i> Logs</button>
+                </div>
+                <div class="drawer-grid-4">
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">Exit Code</div>
+                        <div id="drawerExitCode" class="drawer-stat-value">${c && isStopped(c) ? 'Checking…' : '0'}</div>
+                    </div>
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">Restarts</div>
+                        <div id="drawerRestarts" class="drawer-stat-value">Checking…</div>
+                    </div>
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">CPU</div>
+                        <div class="drawer-stat-value">${escapeHtml(cpuStr)}</div>
+                    </div>
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">RAM</div>
+                        <div class="drawer-stat-value">${escapeHtml(ramStr)}</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-box text-purple-400"></i> Image</div>
+                <div class="flex items-center justify-between gap-2 p-2 bg-slate-950 rounded-lg border border-slate-800">
+                    <code class="text-xs font-mono text-purple-300 break-all select-all">${escapeHtml(formattedImage)}</code>
+                    <button data-action="copy" data-value="${escapeHtml(formattedImage)}" class="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 shrink-0">Copy</button>
+                </div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-network-wired text-cyan-400"></i> Published Ports</div>
+                <div class="flex flex-wrap gap-1.5">${portsHtml}</div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-arrow-right-arrow-left text-emerald-400"></i> Network I/O</div>
+                <div class="flex items-center gap-4 text-xs font-mono text-slate-300 p-2 bg-slate-950 rounded-lg border border-slate-800">
+                    <span><i class="fa-solid fa-arrow-down text-emerald-400"></i> Received: <strong>${escapeHtml(netRx)}</strong></span>
+                    <span><i class="fa-solid fa-arrow-up text-cyan-400"></i> Transmitted: <strong>${escapeHtml(netTx)}</strong></span>
+                </div>
+                <div id="drawerNetworks" class="mt-2 space-y-1 text-xs font-mono text-slate-400">
+                    <p class="text-[11px] text-slate-500">Inspecting networks…</p>
+                </div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-folder-tree text-amber-400"></i> Mounts &amp; Volumes</div>
+                <div id="drawerMounts" class="space-y-1.5">
+                    <p class="text-[11px] text-slate-500">Inspecting mounts…</p>
+                </div>
+            </div>
+        </div>
+    `;
+
+    openModal(title, subtitle, initialContent, 'fa-cube text-indigo-400', () => inspectContainer(name));
 
     const generation = modalGeneration;
     try {
@@ -872,81 +1200,42 @@ async function inspectContainer(name) {
         const mounts = data.Mounts || [];
         const net = (data.NetworkSettings && data.NetworkSettings.Networks) ? data.NetworkSettings.Networks : {};
 
-        let mountsHtml = mounts.map(m => {
-            const isSecondary = (m.Source || '').includes('/srv/data') || (m.Source || '').includes('/data') || (m.Source || '').includes('/mnt');
-            const diskBadge = isSecondary
-                ? '<span class="text-[10px] px-2 py-0.5 rounded bg-emerald-950/80 text-emerald-300 font-mono border border-emerald-800/40 font-semibold flex items-center gap-1"><i class="fa-solid fa-hard-drive text-[9px]"></i>Secondary Storage</span>'
-                : '<span class="text-[10px] px-2 py-0.5 rounded bg-cyan-950/80 text-cyan-300 font-mono border border-cyan-800/40 font-semibold flex items-center gap-1"><i class="fa-solid fa-bolt text-[9px]"></i>System Storage</span>';
-            return `
-            <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                <div class="flex items-center justify-between mb-1.5">
-                    <div class="flex items-center gap-2">
-                        <span class="text-indigo-400 font-bold uppercase text-[10px] tracking-wider bg-indigo-950/60 px-1.5 py-0.5 rounded border border-indigo-800/40">${m.Type || 'mount'}</span>
-                        <span class="text-xs text-slate-500 font-mono">Mode: ${m.RW ? 'Read-Write (RW)' : 'Read-Only (RO)'}</span>
-                    </div>
-                    ${diskBadge}
-                </div>
-                <div class="text-slate-300 font-mono text-xs break-all">${m.Source}</div>
-                <div class="text-cyan-400 font-mono text-xs mt-0.5 break-all">&rarr; ${m.Destination}</div>
-            </div>
-        `}).join('') || '<div class="text-slate-500">No mounts found</div>';
+        const exitEl = document.getElementById('drawerExitCode');
+        if (exitEl) exitEl.textContent = state.ExitCode ?? '—';
 
-        let netHtml = Object.keys(net).map(k => `
-            <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-1">
-                <span class="text-slate-200 font-bold">${escapeHtml(k)}</span>
-                <div class="flex items-center gap-3 font-mono text-xs">
-                    <span class="text-cyan-400">IP: ${net[k].IPAddress || 'No IP'}</span>
-                    <span class="text-slate-500">Gateway: ${net[k].Gateway || 'None'}</span>
-                </div>
-            </div>
-        `).join('') || '<div class="text-slate-500">No networks attached</div>';
+        const restartEl = document.getElementById('drawerRestarts');
+        if (restartEl) restartEl.textContent = data.RestartCount ?? 0;
 
-        document.getElementById('modalContent').innerHTML = `
-            <div class="space-y-4">
-            <p class="text-xs text-slate-300">Restarts: ${data.RestartCount || 0} · Exit code: ${state.ExitCode ?? '—'} · OOM killed: ${state.OOMKilled ? 'Yes' : 'No'} · Health: ${data.Health?.Status || 'No healthcheck'}</p>
-                <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">Status</div>
-                        <div class="font-bold text-white capitalize">${state.Status || '-'}</div>
-                    </div>
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">Restarts</div>
-                        <div class="font-bold text-white font-mono">${data.RestartCount || 0}</div>
-                    </div>
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">Memory Limit</div>
-                        <div class="font-bold text-white font-mono">${data.Resources && data.Resources.Memory ? formatBytesNoDec(data.Resources.Memory) : 'Unlimited'}</div>
-                    </div>
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">CPU Quota</div>
-                        <div class="font-bold text-white font-mono">${data.Resources && data.Resources.NanoCpus ? (data.Resources.NanoCpus / 1e9) + ' CPUs' : 'Unlimited'}</div>
-                    </div>
+        const netEl = document.getElementById('drawerNetworks');
+        if (netEl) {
+            const netKeys = Object.keys(net);
+            netEl.innerHTML = netKeys.length ? netKeys.map(k => `
+                <div class="flex items-center justify-between p-1.5 bg-slate-900 rounded border border-slate-800 text-[11px]">
+                    <span class="text-slate-300 font-semibold">${escapeHtml(k)}</span>
+                    <span class="text-cyan-400">IP: ${net[k].IPAddress || 'None'}</span>
                 </div>
+            `).join('') : '<p class="text-[11px] text-slate-500">No networks attached</p>';
+        }
 
-                <div>
-                    <h4 class="text-slate-300 font-bold mb-2 flex items-center gap-1.5"><i class="fa-solid fa-folder-tree text-indigo-400"></i> Mounts &amp; Volumes</h4>
-                    <div class="space-y-2">${mountsHtml}</div>
+        const mountsEl = document.getElementById('drawerMounts');
+        if (mountsEl) {
+            mountsEl.innerHTML = mounts.length ? mounts.map(m => `
+                <div class="p-2 bg-slate-950 rounded border border-slate-800 text-xs font-mono">
+                    <div class="flex items-center justify-between text-[10px] text-slate-400 mb-0.5">
+                        <span class="uppercase font-bold text-indigo-400">${escapeHtml(m.Type || 'mount')}</span>
+                        <span>${m.RW ? 'Read-Write' : 'Read-Only'}</span>
+                    </div>
+                    <div class="text-slate-300 truncate" title="${escapeHtml(m.Source)}">${escapeHtml(m.Source)}</div>
+                    <div class="text-cyan-400 truncate" title="${escapeHtml(m.Destination)}">&rarr; ${escapeHtml(m.Destination)}</div>
                 </div>
-
-                <div>
-                    <h4 class="text-slate-300 font-bold mb-2 flex items-center gap-1.5"><i class="fa-solid fa-network-wired text-cyan-400"></i> Networks</h4>
-                    <div class="space-y-2">${netHtml}</div>
-                </div>
-
-                <div class="p-3 bg-slate-950/80 rounded-xl border border-slate-800/80 text-[11px] text-slate-400 flex items-center gap-2">
-                    <i class="fa-solid fa-shield-halved text-emerald-400"></i>
-                    <span>Environment variables (secrets) are stripped server-side to prevent credential or token leakage.</span>
-                </div>
-            </div>
-        `;
+            `).join('') : '<p class="text-[11px] text-slate-500">No mounts found</p>';
+        }
     } catch (err) {
         if (generation !== modalGeneration) return;
-        document.getElementById('modalContent').innerHTML = `
-            <div class="p-6 text-center text-rose-400">
-                <i class="fa-solid fa-triangle-exclamation text-2xl mb-2"></i>
-                <p>${escapeHtml(err.message)}</p>
-            </div>
-        `;
+        const exitEl = document.getElementById('drawerExitCode');
+        if (exitEl) exitEl.textContent = '—';
+        const restartEl = document.getElementById('drawerRestarts');
+        if (restartEl) restartEl.textContent = '—';
     }
 }
 
@@ -1047,13 +1336,55 @@ function portUrl(port) {
     return url.href;
 }
 function renderIssues(data) {
-    const rows = Object.values(data.stacks || {}).flatMap(stack => stack.containers);
-    const count = rows.filter(needsAttention).length;
+    const rows = Object.values(data.stacks || {}).flatMap(stack => stack.containers || []);
+    const issuesCount = rows.filter(needsAttention).length;
+    const runningCount = rows.filter(isRunning).length;
+    const stoppedCount = rows.filter(isStopped).length;
+    const allCount = rows.length;
+
     const summary = document.getElementById('issuesSummary');
-    summary.textContent = count ? `${count} need attention` : 'All healthy';
-    summary.classList.toggle('attention', count > 0);
-    summary.dataset.value = count ? 'issues' : 'all';
-    document.getElementById('qf-issues').textContent = `Needs attention (${count})`;
+    summary.textContent = issuesCount ? `${issuesCount} ${issuesCount === 1 ? 'needs' : 'need'} attention` : 'No active issues';
+    summary.classList.toggle('attention', issuesCount > 0);
+    summary.dataset.value = issuesCount ? 'issues' : 'all';
+
+    const countAllEl = document.getElementById('count-all');
+    if (countAllEl) countAllEl.textContent = allCount;
+
+    // Hide stopped segments whose count is 0
+    const stoppedBtn = document.getElementById('qf-stopped');
+    if (stoppedBtn) {
+        if (stoppedCount === 0) {
+            stoppedBtn.hidden = true;
+            if (activeQuickFilter === 'stopped') setQuickFilter('all');
+        } else {
+            stoppedBtn.hidden = false;
+            stoppedBtn.textContent = `Stopped (${stoppedCount})`;
+        }
+    }
+
+    // Hide issues segments whose count is 0
+    const issuesBtn = document.getElementById('qf-issues');
+    if (issuesBtn) {
+        if (issuesCount === 0) {
+            issuesBtn.hidden = true;
+            if (activeQuickFilter === 'issues') setQuickFilter('all');
+        } else {
+            issuesBtn.hidden = false;
+            issuesBtn.textContent = `Needs attention (${issuesCount})`;
+        }
+    }
+
+    // Show Running only when it differs from All
+    const runningBtn = document.getElementById('qf-running');
+    if (runningBtn) {
+        if (runningCount === allCount || runningCount === 0) {
+            runningBtn.hidden = true;
+            if (activeQuickFilter === 'running') setQuickFilter('all');
+        } else {
+            runningBtn.hidden = false;
+            runningBtn.textContent = `Running (${runningCount})`;
+        }
+    }
 }
 function relativeTime(timestamp) {
     return timestamp ? `${Math.max(0, Math.floor(Date.now() / 1000 - timestamp))}s ago` : 'No sample yet';
@@ -1097,10 +1428,13 @@ document.addEventListener('click', event => {
     const value = button.dataset.value;
     const actions = {
         close: closeModal, refresh: () => fetchStats(true), auto: toggleAutoRefresh,
-        expand: () => toggleExpandAll(!Object.keys(latestData?.stacks || {}).every(key => expandedStacks.has(key))), stack: () => toggleStack(value),
+        expand: () => toggleExpandAll(!Object.keys(dashboardData()?.stacks || {}).every(key => expandedStacks.has(key))), stack: () => toggleStack(value),
         card: () => openTopCardModal(value), filter: () => setQuickFilter(value),
         inspect: () => inspectContainer(value), logs: () => viewLogs(value),
         copy: () => copyText(value, button), 'copy-logs': () => copyText(document.getElementById('logText')?.textContent, button),
+        organize: () => organizeStacks(value), 'stack-assign': () => assignStack(), 'stack-reset': () => assignStack(true),
+        'stack-select': () => { document.querySelectorAll('.stack-choice:not([hidden]) input').forEach(input => { input.checked = true; }); updateStackSelection(); },
+        'stack-clear': () => { document.querySelectorAll('#stackChoices input').forEach(input => { input.checked = false; }); updateStackSelection(); },
         diagnostics: showDiagnostics, 'copy-diagnostics': () => copyText(document.getElementById('diagnosticsText')?.textContent, button), 'log-download': downloadLogs,
         'log-pause': () => {
             if (!logState) return;
@@ -1115,7 +1449,7 @@ document.getElementById('searchInput').value = typeof preferences.search === 'st
 if (['cpu','mem','containers','name'].includes(preferences.sort)) document.getElementById('sortBy').value = preferences.sort;
 document.getElementById('searchInput').addEventListener('input', renderDashboard);
 document.getElementById('sortBy').addEventListener('change', renderDashboard);
-setQuickFilter(['all','cpu','mem','ports','secondary','root','issues'].includes(activeQuickFilter) ? activeQuickFilter : 'all');
+setQuickFilter(activeQuickFilter);
 fetchStats();
 startInterval();
 

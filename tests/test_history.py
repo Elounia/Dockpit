@@ -72,10 +72,11 @@ class SamplingTests(unittest.TestCase):
         thread.start()
         url = f'http://127.0.0.1:{server.server_port}/api/history'
         try:
-            with patch.object(app, 'history', history):
+            with patch.object(app, 'history', history), patch.object(app, 'cached_data', {'system': {'cpus':8, 'mem_total_bytes':16 * 1024**3}}), patch.object(app, 'host_sample', {}):
                 with urlopen(url) as response:
                     first = json.load(response)
                 self.assertEqual(len(first['points']), 2)
+                self.assertEqual(first['capacity'], {'cpu_threads':8, 'memory_bytes':16 * 1024**3})
                 with urlopen(url + '?since=' + str(first['cursor'])) as response:
                     self.assertEqual(json.load(response)['points'], [])
                 with urlopen(url + '?since=' + str(now + 1)) as response:
@@ -91,6 +92,28 @@ class SamplingTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_html_edits_are_served_without_restarting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page = root / 'index.html'
+            page.write_text('<html>First version</html>')
+            server = app.ThreadingHTTPServer(('127.0.0.1', 0), app.DockerCockpitHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.object(app, 'STATIC_DIR', root):
+                    url = f'http://127.0.0.1:{server.server_port}/'
+                    with urlopen(url) as response:
+                        self.assertIn(b'First version', response.read())
+                        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+                    page.write_text('<html>Updated version</html>')
+                    with urlopen(url) as response:
+                        self.assertIn(b'Updated version', response.read())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
     def test_missing_measurements_and_gpu_have_reasons_and_fixes(self):
         data = {'system': {'gpu': {'devices':[{'name':'Intel iGPU','vendor':'Intel'}]}}, 'hidden_containers':2, 'inventory_total':5}
