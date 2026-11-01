@@ -11,9 +11,18 @@ No third-party Python runtime dependencies. Browser assets are included and work
 
 ## Preview
 
-![Illustrative dashboard preview](assets/screenshot.svg)
+![Dockpit dashboard with host metrics and Compose stacks](assets/screenshot-overview.png)
 
-The preview uses sample data. See the running dashboard for current features.
+Real browser screenshots of Dockpit running with sample data, captured in Chromium.
+
+<details>
+<summary>View expanded stacks and container metrics</summary>
+
+![Dockpit with expanded stacks and per-container CPU and memory usage](assets/screenshot-stacks.png)
+
+</details>
+
+To capture fresh screenshots, install Playwright and Chromium (`python3 -m pip install playwright` and `python3 -m playwright install chromium`), then run `python3 scripts/capture-screenshots.py`. The capture uses synthetic data and does not connect to Docker.
 
 ## Features
 
