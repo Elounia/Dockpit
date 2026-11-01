@@ -29,6 +29,61 @@ def container_fixture(name='known', state='running', status='Up 1 hour (healthy)
 
 
 class MetricsTests(unittest.TestCase):
+    def test_stack_labels_take_precedence_over_compose_and_swarm(self):
+        labels = {'dockpit.stack': ' Games ', 'com.docker.compose.project': 'demo', 'com.docker.stack.namespace': 'swarm'}
+        row = monitor.container_metadata(container_fixture(labels=labels))
+        self.assertEqual((row['stack'], row['stack_source'], row['compose_project']), ('Games', 'label', 'demo'))
+        labels['dockpit.stack'] = ' '
+        self.assertEqual(monitor.container_metadata(container_fixture(labels=labels))['stack'], 'demo')
+        del labels['com.docker.compose.project']
+        row = monitor.container_metadata(container_fixture(labels=labels))
+        self.assertEqual((row['stack'], row['stack_source']), ('swarm', 'swarm'))
+
+    def test_automatic_image_groups_preserve_explicit_projects(self):
+        def row(name, image, labels=None):
+            c = container_fixture(name)
+            c.update(Image=image, Labels=labels or {})
+            return monitor.container_metadata(c)
+        rows = [row('AMP_Valheim01', 'cubecoders/ampbase:debian'),
+                row('AMP_Enshrouded01', 'cubecoders/ampbase@sha256:abcd'),
+                row('worker1', 'localhost:5000/team/worker:1'),
+                row('worker2', 'localhost:5000/team/worker:2'),
+                row('other-worker', 'other/worker:1'),
+                row('web1', 'docker.io/library/nginx:1'), row('web2', 'nginx:2'),
+                row('redis1', 'redis:1', {'com.docker.compose.project': 'first'}),
+                row('redis2', 'redis:1', {'com.docker.compose.project': 'second'}),
+                row('unknown1', 'sha256:abcd'), row('unknown2', 'sha256:abcd')]
+        monitor.group_standalone_containers(rows)
+        stacks = {r['name']: r['stack'] for r in rows}
+        self.assertEqual(stacks['AMP_Valheim01'], 'AMP')
+        self.assertEqual(stacks['AMP_Enshrouded01'], 'AMP')
+        self.assertEqual(rows[0]['stack_source'], 'image')
+        self.assertEqual(stacks['worker1'], stacks['worker2'])
+        self.assertEqual(stacks['worker1'], 'localhost:5000/team/worker')
+        self.assertEqual(stacks['other-worker'], 'Standalone')
+        self.assertEqual(stacks['web1'], stacks['web2'])
+        self.assertEqual((stacks['redis1'], stacks['redis2']), ('first', 'second'))
+        self.assertEqual(stacks['unknown1'], 'Standalone')
+
+    def test_inferred_stack_cannot_merge_with_explicit_stack(self):
+        rows = [{'stack': 'AMP', 'stack_source': 'compose'},
+                {'stack': 'Standalone', 'stack_source': 'standalone', 'image': 'cubecoders/ampbase:debian'}]
+        monitor.group_standalone_containers(rows)
+        self.assertEqual(rows[1]['stack'], 'Image: AMP')
+
+    def test_image_grouping_matches_in_socket_and_cli_snapshots(self):
+        containers = [dict(container_fixture(name, 'exited', 'Exited (0)'), Image='cubecoders/ampbase:debian', Labels={}) for name in ('AMP_one', 'AMP_two')]
+        cli_containers = [dict(ID=c['Id'], Names=c['Names'][0], Image=c['Image'], Labels='', State=c['State'], Status=c['Status']) for c in containers]
+        with patch.object(monitor, 'get_system_metrics', return_value=system_fixture()), patch.object(monitor, 'docker_json', return_value=containers):
+            socket = monitor._fetch_docker_metrics_socket()
+        responses = [subprocess.CompletedProcess([], 0, '\n'.join(map(json.dumps, rows))) for rows in (cli_containers, [])]
+        with patch.object(monitor, 'get_system_metrics', return_value=system_fixture()), patch.object(monitor.subprocess, 'run', side_effect=responses):
+            cli = monitor._fetch_docker_metrics_subprocess()
+        for data in (socket, cli):
+            self.assertEqual(data['total_stacks'], 1)
+            self.assertEqual(data['stacks']['AMP']['total_containers'], 2)
+            self.assertEqual({c['stack_source'] for c in data['stacks']['AMP']['containers']}, {'image'})
+
     def test_health_stopped_containers_and_whole_host_cpu(self):
         containers = [
             dict(Names=['broken'], ID='abc123456789', State='running', Status='Up 1 hour (unhealthy)', Labels='com.docker.compose.project=demo'),
@@ -265,9 +320,17 @@ class HttpHardeningTests(ServerTests):
             self.assertIn("script-src 'self'", response.headers['Content-Security-Policy'])
 
     def test_assets_and_traversal(self):
-        for asset in ['app.js', 'app.css', 'vendor/fontawesome/webfonts/fa-solid-900.woff2']:
+        for asset in ['app.js', 'app.css', 'icon.svg', 'favicon.ico', 'vendor/fontawesome/webfonts/fa-solid-900.woff2']:
             with urlopen(self.url + '/static/' + asset) as response:
                 self.assertEqual(response.status, 200)
+        with urlopen(self.url + '/favicon.ico') as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers['Content-Type'], 'image/x-icon')
+        with urlopen(self.url + '/') as response:
+            body = response.read().decode('utf-8')
+            self.assertIn('/static/icon.svg', body)
+            self.assertIn('app-footer', body)
+            self.assertIn('https://github.com/Elounia/Dockpit', body)
         with self.assertRaises(HTTPError) as error:
             urlopen(self.url + '/static/../../pyproject.toml')
         self.assertEqual(error.exception.code, 404)

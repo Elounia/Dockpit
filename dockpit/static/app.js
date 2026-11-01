@@ -16,10 +16,12 @@ function savePreferences() {
         expanded: [...expandedStacks], filter: activeQuickFilter,
         sort: document.getElementById('sortBy').value,
         search: document.getElementById('searchInput').value,
-    })); } catch { /* Storage can be disabled by the browser. */ }
+        stackAssignments: Object.fromEntries(stackAssignments),
+    })); return true; } catch { return false; /* Storage can be disabled by the browser. */ }
 }
 const preferences = loadPreferences();
 let latestData = null;
+const stackAssignments = new Map(Object.entries(preferences.stackAssignments || {}).filter(([name, stack]) => typeof stack === 'string' && stack.trim() && stack.length <= 120));
 let modalGeneration = 0;
 let modalPreviousFocus = null;
 let autoRefresh = true;
@@ -83,31 +85,27 @@ function getStackIcon(name) {
 }
 
 let statsPending = false;
+let statsAbort = null;
 async function fetchStats(force = false) {
-    if (statsPending) return;
+    if (statsPending || document.hidden || (!autoRefresh && !force)) return;
     statsPending = true;
+    statsAbort = new AbortController();
     try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/stats', {signal: statsAbort.signal});
         if (!res.ok) throw new Error('API returned status ' + res.status);
         const data = await res.json();
         latestData = data;
 
-        updateTopKPIs(data);
+        updateTopKPIs(dashboardData());
         renderDashboard();
 
-        const sampled = new Date(data.timestamp * 1000);
-        document.getElementById('statusText').textContent = (data.stale ? 'Stale · last sample ' : 'Sampled ') + sampled.toLocaleTimeString();
-        const warning = document.getElementById('dataWarning');
-        warning.textContent = data.stale ? 'Docker measurements are stale. Open Diagnostics to check access and polling.' : '';
-        warning.classList.toggle('hidden', !data.stale);
+        updateSystemIndicator(data);
         renderIssues(data);
-        refreshHistory();
+
     } catch (err) {
+        if (err.name === 'AbortError') return;
         console.error('Error fetching stats:', err);
-        document.getElementById('statusText').textContent = 'Connection error';
-        const warning = document.getElementById('dataWarning');
-        warning.textContent = 'Measurements could not be refreshed. Displayed values may be outdated.';
-        warning.classList.remove('hidden');
+        updateSystemIndicator(latestData, true);
     } finally { statsPending = false; }
 }
 
@@ -129,77 +127,118 @@ function formatBytesNoDec(numBytes) {
     return Math.round(num) + ' B';
 }
 
-function updateTopKPIs(data) {
-    const sys = data.system || {};
+function cleanGpuName(rawName) {
+    if (!rawName) return '';
+    return rawName.replace(/\s*\[.*?\]/g, '').trim() || rawName;
+}
 
-    // 1. Host CPU
-    const hostCpu = (sys.host_cpu_pct == null ? 'Unavailable' : sys.host_cpu_pct.toFixed(1));
-    document.getElementById('sysCpu').textContent = hostCpu === 'Unavailable' ? hostCpu : `${hostCpu} %`;
-    document.getElementById('sysCpuBar').style.width = (Number.isFinite(parseFloat(hostCpu)) ? Math.min(100, Math.max(0, parseFloat(hostCpu))) : 0) + '%';
-    document.getElementById('sysCpuCores').textContent = `${sys.cpus || 1} Cores`;
-    document.getElementById('sysLoad').textContent = sys.load_str || '-';
-
-    const dockerCpuEl = document.getElementById('sysDockerCpu');
-    const dockerTotal = (data.docker_total_cpu || 0).toFixed(1);
-    dockerCpuEl.textContent = `${dockerTotal}%`;
-
-    const dockerHostEl = document.getElementById('sysDockerHostCpu');
-    if (dockerHostEl) {
-        const hostShare = (dockerTotal / (sys.cpus || 1)).toFixed(1);
-        dockerHostEl.textContent = `(${hostShare}% host)`;
+function formatImageName(img) {
+    if (!img) return '—';
+    if (img.startsWith('sha256:')) return img.slice(7, 19);
+    if (/^[0-9a-f]{64}$/i.test(img)) return img.slice(0, 12);
+    if (img.includes('@sha256:')) {
+        const [repo, digest] = img.split('@sha256:');
+        return `${repo}:${digest.slice(0, 12)}`;
     }
+    return img;
+}
 
-    // 2. System RAM
-    document.getElementById('sysRam').textContent = sys.mem_used_formatted || '-';
-    document.getElementById('sysRamPct').textContent = sys.mem_pct == null ? 'Unavailable' : `${sys.mem_pct}%`;
-    document.getElementById('sysRamBar').style.width = Math.min(100, Math.max(3, sys.mem_pct || 0)) + '%';
-    document.getElementById('sysRamSub').textContent = `of ${sys.mem_total_formatted || 'Unavailable'}`;
-    document.getElementById('sysDockerRam').textContent = `${data.docker_total_mem_str || '0 B'} (${data.docker_total_mem_perc || 0}%)`;
-
-    // 3. System Storage
-    const rootDisk = sys.root_disk || {};
-    const rootUsed = formatBytesNoDec(rootDisk.used_bytes || sys.root_used_bytes || 0);
-    const rootTotal = formatBytesNoDec(rootDisk.total_bytes || sys.root_total_bytes || 0);
-    const rootPct = Math.round(rootDisk.pct !== undefined ? rootDisk.pct : (sys.root_pct || 0));
-    const nvmeStatsEl = document.getElementById('sysNvmeStats');
-    if (nvmeStatsEl) nvmeStatsEl.textContent = rootDisk.total_bytes == null ? 'Unavailable' : `${rootUsed} / ${rootTotal} (${rootPct}%)`;
-    const nvmeBarEl = document.getElementById('sysNvmeBar');
-    if (nvmeBarEl) nvmeBarEl.style.width = Math.min(100, Math.max(3, rootPct)) + '%';
-
-    document.getElementById('sysDataStats').textContent = 'Not configured';
-    document.getElementById('sysDataBar').style.width = '0%';
-    const dataDisk = sys.data_disk;
-    if (dataDisk) {
-        const dataUsed = formatBytesNoDec(dataDisk.used_bytes || 0);
-        const dataTotal = formatBytesNoDec(dataDisk.total_bytes || 0);
-        const dataPct = Math.round(dataDisk.pct || 0);
-        const dataStatsEl = document.getElementById('sysDataStats');
-        if (dataStatsEl) dataStatsEl.textContent = `${dataUsed} / ${dataTotal} (${dataPct}%)`;
-        const dataBarEl = document.getElementById('sysDataBar');
-        if (dataBarEl) dataBarEl.style.width = Math.min(100, Math.max(3, dataPct)) + '%';
+function renderPortChips(portsStr) {
+    if (!portsStr || !portsStr.trim()) {
+        return '<span class="muted text-xs">No published ports</span>';
     }
-
-    // 4. Containers & Uptime
-    const runningCount = data.running_containers !== undefined ? data.running_containers : (data.total_containers || 0);
-    const totalCount = data.total_containers || runningCount;
-    document.getElementById('sysHealth').textContent = `${runningCount} / ${totalCount}`;
-    document.getElementById('sysUptime').textContent = `Uptime: ${sys.uptime_str || '-'}`;
-    document.getElementById('sysPids').textContent = data.total_pids || 0;
-    document.getElementById('count-all').textContent = totalCount;
-    const healthBar = document.getElementById('sysHealthBar');
-    if (healthBar) {
-        const healthPct = totalCount > 0 ? (runningCount / totalCount) * 100 : 100;
-        healthBar.style.width = healthPct + '%';
-    }
-    const cStatsEl = document.getElementById('sysContainerStats');
-    if (cStatsEl) {
-        const unhealthy = data.unhealthy_containers || 0;
-        if (unhealthy > 0) {
-            cStatsEl.innerHTML = `<span class="text-rose-400 font-medium">${unhealthy} unhealthy</span>`;
+    const parts = portsStr.split(',').map(s => s.trim()).filter(Boolean);
+    const seen = new Set();
+    const chips = [];
+    for (const part of parts) {
+        const match = part.match(/(?:(?:[0-9.]+|\[[0-9a-f:]+\]):)?(\d+)->(\d+(?:\/\w+)?)/i);
+        if (match) {
+            const hostPort = match[1];
+            const containerPort = match[2];
+            const key = `${hostPort}->${containerPort}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const url = portUrl(hostPort);
+            chips.push(`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="port-chip" title="Open port ${hostPort}">${escapeHtml(hostPort)} &rarr; ${escapeHtml(containerPort)} <i class="fa-solid fa-arrow-up-right-from-square" style="font-size:9px"></i></a>`);
         } else {
-            cStatsEl.innerHTML = `<span class="text-emerald-400 font-medium">${data.total_stacks || 0} stacks</span>`;
+            if (seen.has(part)) continue;
+            seen.add(part);
+            chips.push(`<span class="port-chip port-internal">${escapeHtml(part)}</span>`);
         }
     }
+    return chips.length ? chips.join(' ') : '<span class="muted text-xs">No published ports</span>';
+}
+
+function findContainer(name) {
+    const data = dashboardData();
+    if (!data || !data.stacks) return null;
+    for (const stack of Object.values(data.stacks)) {
+        for (const c of stack.containers || []) {
+            if (c.name === name || c.display_name === name) return c;
+        }
+    }
+    return null;
+}
+
+function updateTopKPIs(data) {
+    const sys = data.system || {}, gpu = sys.gpu || {}, devices = gpu.devices || [];
+    const text = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    };
+    const bar = (id, value) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.style.width = `${Math.min(100, Math.max(0, value || 0))}%`;
+        el.className = value >= 90 ? 'critical' : value >= 75 ? 'warning' : '';
+    };
+    text('sysCpu', sys.host_cpu_pct == null ? 'Unavailable' : `${sys.host_cpu_pct.toFixed(1)}%`);
+    text('sysCpuCores', `${sys.cpus || 1} cores · Docker ${(data.docker_host_cpu_perc || 0).toFixed(1)}%`);
+    bar('sysCpuBar', sys.host_cpu_pct);
+    text('sysRam', sys.mem_used_formatted || 'Unavailable');
+    text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct == null ? '—' : sys.mem_pct.toFixed(1)}%\nDocker ${data.docker_total_mem_str ?? 'Unavailable'}`);
+    bar('sysRamBar', sys.mem_pct);
+
+    const disk = sys.root_disk || {};
+    const dataDisk = sys.data_disk;
+    text('sysNvmeStats', disk.total_bytes == null ? 'Unavailable' : formatBytesNoDec(disk.used_bytes));
+    bar('sysNvmeBar', disk.pct);
+    const dataWrap = document.getElementById('sysDataWrap');
+    if (dataWrap) {
+        if (dataDisk && dataDisk.total_bytes) {
+            dataWrap.hidden = false;
+            bar('sysDataBar', dataDisk.pct);
+            const nvmeWrap = document.getElementById('sysNvmeWrap');
+            if (nvmeWrap) nvmeWrap.title = `Root: ${formatBytesNoDec(disk.used_bytes)} / ${formatBytesNoDec(disk.total_bytes)} (${disk.pct ?? 0}%)`;
+            dataWrap.title = `Data: ${formatBytesNoDec(dataDisk.used_bytes)} / ${formatBytesNoDec(dataDisk.total_bytes)} (${dataDisk.pct ?? 0}%)`;
+            text('storageSub', `Root ${disk.pct ?? '—'}% · Data ${dataDisk.pct ?? '—'}% of ${formatBytesNoDec(dataDisk.total_bytes)}`);
+        } else {
+            dataWrap.hidden = true;
+            text('storageSub', `of ${formatBytesNoDec(disk.total_bytes)} · ${disk.pct ?? '—'}% used`);
+        }
+    }
+
+    const total = data.total_containers || 0, running = data.running_containers || 0;
+    text('sysHealth', `${running} / ${total}`);
+    text('sysUptime', `${data.total_stacks || 0} stacks · Up ${sys.uptime_str || '—'}`);
+    text('count-all', total);
+    bar('sysHealthBar', total ? running / total * 100 : 0);
+    const healthBar = document.getElementById('sysHealthBar');
+    if (healthBar) healthBar.className = '';
+
+    const gpuNames = devices.map(d => cleanGpuName(d.name)).filter(Boolean).join(', ');
+    const gpuMain = gpu.utilization_pct != null ? `${gpu.utilization_pct.toFixed(1)}%` : gpuNames || 'No GPU';
+    text('sysGpu', gpuMain);
+    const sysGpuEl = document.getElementById('sysGpu');
+    if (sysGpuEl) {
+        sysGpuEl.title = gpuNames || (gpu.utilization_pct != null ? `${gpu.utilization_pct.toFixed(1)}%` : 'No GPU');
+        sysGpuEl.classList.toggle('no-metrics', gpu.utilization_pct == null);
+    }
+    const subText = gpu.utilization_pct != null ? gpuNames : devices.length ? 'No usage data' : 'No GPU detected';
+    text('sysGpuName', subText);
+    const sysGpuNameEl = document.getElementById('sysGpuName');
+    if (sysGpuNameEl) sysGpuNameEl.title = subText;
+    bar('sysGpuBar', gpu.utilization_pct);
 }
 
 function toggleStack(stackName) {
@@ -209,28 +248,26 @@ function toggleStack(stackName) {
         expandedStacks.add(stackName);
     }
     renderDashboard();
+    checkAutoResort();
 }
 
 function toggleExpandAll(expand) {
     if (!latestData || !latestData.stacks) return;
     if (expand) {
-        Object.keys(latestData.stacks).forEach(s => expandedStacks.add(s));
+        Object.keys(dashboardData().stacks).forEach(s => expandedStacks.add(s));
     } else {
         expandedStacks.clear();
     }
     renderDashboard();
+    checkAutoResort();
 }
 
 function setQuickFilter(type) {
-    activeQuickFilter = type;
-    document.querySelectorAll('.qf-btn').forEach(btn => {
-        btn.className = 'qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition cursor-pointer';
-    });
-    const activeBtn = document.getElementById('qf-' + type);
-    if (activeBtn) {
-        activeBtn.className = 'qf-btn text-xs px-3 py-1 rounded-lg bg-indigo-600 text-white font-medium transition cursor-pointer';
-    }
-    renderDashboard();
+    activeQuickFilter = ['all', 'running', 'stopped', 'issues', 'paused', 'starting', 'ports'].includes(type) ? type : 'all';
+    document.querySelectorAll('.qf-btn').forEach(btn => btn.setAttribute('aria-pressed', btn.dataset.value === activeQuickFilter));
+    const extra = document.querySelector(`.filter-popover [data-value="${activeQuickFilter}"]`);
+    document.querySelector('.filters summary').textContent = extra ? extra.textContent : 'More filters';
+    renderDashboard(true);
 }
 
 function toggleAutoRefresh() {
@@ -242,10 +279,13 @@ function toggleAutoRefresh() {
         btnText.textContent = 'Pause';
         btnIcon.className = 'fa-solid fa-pause';
         startInterval();
+        historyChart.start();
+        fetchStats();
     } else {
         btnText.textContent = 'Start';
         btnIcon.className = 'fa-solid fa-play';
         clearInterval(refreshInterval);
+        historyChart.stop();
     }
 }
 
@@ -253,12 +293,32 @@ function startInterval() {
     clearInterval(refreshInterval);
     refreshInterval = setInterval(() => {
         if (autoRefresh) fetchStats();
-    }, 2500);
+    }, (latestData?.poll_interval || 2) * 1000);
 }
 
 // ==========================================
 // TOP 4 CARDS INTERACTIVE MODALS
 // ==========================================
+function openGpuStatus(gpu) {
+    const devices = gpu.devices || [];
+    const number = (value, suffix) => value == null ? 'Not measured' : `${value.toFixed(1)}${suffix}`;
+    const bytes = value => value == null ? 'Unavailable' : formatBytesNoDec(value);
+    const content = devices.map(device => `<section class="gpu-device">
+        <h4>${device.name}</h4><p class="muted">${device.vendor || ''}</p>
+        <div class="diagnostic-facts">
+            <div>GPU load: <span>${number(device.utilization_pct, '%')}</span></div>
+            <div>${device.memory_kind === 'shared' ? 'Memory: <span>Shared system RAM</span>' : `VRAM: <span>${bytes(device.memory_used_bytes)} / ${bytes(device.memory_total_bytes)}</span>`}</div>
+            ${device.frequency_mhz == null ? '' : `<div>Current clock: <span>${device.frequency_mhz.toFixed(0)} MHz</span></div>`}
+            ${device.max_frequency_mhz == null ? '' : `<div>Configured max clock: <span>${device.max_frequency_mhz.toFixed(0)} MHz</span></div>`}
+            ${device.temperature_c == null ? '' : `<div>Temperature: <span>${number(device.temperature_c, ' °C')}</span></div>`}
+            ${device.power_w == null ? '' : `<div>Power: <span>${number(device.power_w, ' W')}</span></div>`}
+        </div>
+        ${device.utilization_note ? `<p class="muted">${device.utilization_note}</p>` : ''}
+        ${device.memory_note ? `<p class="muted">${device.memory_note}</p>` : ''}
+    </section>`).join('') || '<p class="muted">No GPU detected.</p>';
+    openModal('GPU', 'Device measurements', content, '', () => fetchStats(true).then(() => openTopCardModal('gpu')));
+}
+
 function openTopCardModal(type) {
     if (!latestData) return;
     const sys = escapedView(latestData.system || {});
@@ -266,6 +326,8 @@ function openTopCardModal(type) {
 
     if (type === 'cpu') {
         renderCpuDetailsModal(sys, details.cpu || {});
+    } else if (type === 'gpu') {
+        openGpuStatus(sys.gpu || {});
     } else if (type === 'memory') {
         renderMemoryDetailsModal(sys, details.memory || {});
     } else if (type === 'storage') {
@@ -275,8 +337,37 @@ function openTopCardModal(type) {
     }
 }
 
+function gpuPercent(value) {
+    return value == null ? 'Unavailable' : `${value.toFixed(1)}%`;
+}
+function gpuBytes(value) {
+    return value == null ? 'Unavailable' : formatBytesNoDec(value);
+}
+function renderGpuDetailsModal(gpu) {
+    const devices = gpu.devices || [];
+    const content = devices.map(d => `
+        <div class="bg-slate-950 p-3.5 rounded-xl border border-slate-800 space-y-2">
+            <h4 class="text-white font-bold">${d.name}</h4>
+            <div class="text-xs text-slate-400 font-mono">${d.vendor} · ${d.id}</div>
+            <div class="grid grid-cols-2 gap-3 text-sm text-slate-300">
+                <div>GPU load: <strong>${d.utilization_pct == null ? 'Not measured' : gpuPercent(d.utilization_pct)}</strong></div>
+                <div>${d.memory_kind === 'shared' ? 'Memory: <strong>Shared system RAM</strong>' : `VRAM: <strong>${gpuBytes(d.memory_used_bytes)} / ${gpuBytes(d.memory_total_bytes)}</strong>`}</div>
+                ${d.frequency_mhz == null ? '' : `<div>Current clock: <strong>${d.frequency_mhz.toFixed(0)} MHz</strong></div>`}
+                ${d.max_frequency_mhz == null ? '' : `<div>Configured max clock: <strong>${d.max_frequency_mhz.toFixed(0)} MHz</strong></div>`}
+                ${d.temperature_c == null ? '' : `<div>Temperature: <strong>${d.temperature_c.toFixed(1)} °C</strong></div>`}
+                ${d.power_w == null ? '' : `<div>Power: <strong>${d.power_w.toFixed(1)} W</strong></div>`}
+            </div>
+            ${d.utilization_pct == null && d.utilization_note ? `<p class="text-xs text-amber-300">${d.utilization_note}</p>` : ''}
+            ${d.memory_note ? `<p class="text-xs text-slate-400">${d.memory_note}</p>` : ''}
+        </div>`).join('') || '<p class="text-slate-400">No GPU detected. GPU measurements are unavailable.</p>';
+    const measured = devices.length && devices.every(d => d.utilization_pct != null);
+    openModal('Host GPU & memory', `${devices.length} graphics device(s) · ${measured ? 'utilization averaged across GPUs' : 'load measurements incomplete'}`,
+        content + '<p class="text-xs text-slate-400">Temperature and power appear when exposed by the device. Container GPU shows measured process activity and dedicated VRAM where supported.</p>',
+        'fa-microchip text-emerald-400', () => fetchStats(true).then(() => openTopCardModal('gpu')));
+}
+
 function renderCpuDetailsModal(sys, cpu) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     const hostCpu = (sys.host_cpu_pct == null ? 'Unavailable' : sys.host_cpu_pct.toFixed(1));
     const dockerTotal = (view.docker_total_cpu || 0).toFixed(1);
     const hostShare = ((dockerTotal / (sys.cpus || 1)) || 0).toFixed(1);
@@ -398,7 +489,7 @@ function renderCpuDetailsModal(sys, cpu) {
 }
 
 function renderMemoryDetailsModal(sys, mem) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     let allContainers = [];
     if (view.stacks) {
         Object.values(view.stacks).forEach(s => {
@@ -530,7 +621,7 @@ function renderMemoryDetailsModal(sys, mem) {
 }
 
 function renderStorageDetailsModal(sys, storage) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     const devices = storage.devices || [];
 
     let devicesHtml = '';
@@ -668,7 +759,7 @@ function renderStorageDetailsModal(sys, storage) {
 }
 
 function renderSystemDetailsModal(sys, docker) {
-    const view = escapedView(latestData);
+    const view = escapedView(dashboardData());
     const runningCount = view.running_containers !== undefined ? view.running_containers : (view.total_containers || 0);
     const totalCount = view.total_containers || runningCount;
     const unhealthyCount = view.unhealthy_containers || 0;
@@ -770,8 +861,465 @@ function renderSystemDetailsModal(sys, docker) {
     );
 }
 
-function renderDashboard() {
-    const view = escapedView(latestData);
+function dashboardData() {
+    if (!latestData) return null;
+    const stacks = new Map();
+    for (const source of Object.values(latestData.stacks || {})) {
+        for (const original of source.containers || []) {
+            const name = stackAssignments.get(original.name) || original.stack || source.name;
+            const c = {...original, stack: name, stack_source: stackAssignments.has(original.name) ? 'manual' : original.stack_source};
+            if (!stacks.has(name)) stacks.set(name, {name, containers: [], total_cpu: 0, total_mem_bytes: 0, total_pids: 0, healthy_count: 0, total_containers: 0});
+            const stack = stacks.get(name);
+            stack.containers.push(c);
+            stack.total_cpu += c.cpu_perc || 0;
+            stack.total_mem_bytes += c.mem_used_bytes || 0;
+            stack.total_pids += c.pids || 0;
+            stack.healthy_count += ['healthy', 'running'].includes(c.health) ? 1 : 0;
+            stack.total_containers++;
+        }
+    }
+    for (const stack of stacks.values()) {
+        stack.total_mem_formatted = formatBytesNoDec(stack.total_mem_bytes);
+        stack.host_mem_perc = latestData.host_total_mem_bytes ? stack.total_mem_bytes / latestData.host_total_mem_bytes * 100 : 0;
+        stack.docker_mem_share = latestData.docker_total_mem_bytes ? Math.round(stack.total_mem_bytes / latestData.docker_total_mem_bytes * 100) : 0;
+    }
+    return {...latestData, stacks: Object.fromEntries(stacks), total_stacks: stacks.size};
+}
+
+function organizeStacks(preselect = '') {
+    if (!latestData) return;
+    const data = dashboardData();
+    const containers = Object.values(data.stacks).flatMap(s => s.containers).sort((a, b) => a.name.localeCompare(b.name));
+    const reasons = {label: 'Stack label', compose: 'Compose project', swarm: 'Swarm stack', image: 'Same image', standalone: 'No stack metadata', manual: 'Your choice'};
+    openModal('Organize stacks', 'Select containers, then choose an existing stack or create one.', `
+        <div class="space-y-3">
+            <p class="text-xs text-slate-400">Your choices are saved in this browser and survive container recreation with the same name. Use a dockpit.stack label to share a stack with everyone.</p>
+            <label class="block text-sm text-slate-300">Find containers
+                <input id="stackSearch" type="search" class="w-full mt-1 p-2 rounded-lg bg-slate-950 border border-slate-700" placeholder="Name, stack or image">
+            </label>
+            <div class="flex items-center gap-3 text-xs text-slate-300">
+                <button data-action="stack-select" class="px-3 py-2 rounded-lg bg-slate-800">Select visible</button>
+                <button data-action="stack-clear" class="px-3 py-2 rounded-lg bg-slate-800">Clear selection</button>
+                <span id="stackSelection" role="status"></span>
+            </div>
+            <div id="stackChoices" class="stack-choices border border-slate-800 rounded-xl divide-y divide-slate-800">
+                ${containers.map(c => `<label class="stack-choice flex items-center gap-3 p-3 cursor-pointer hover:bg-slate-800" data-search="${escapeHtml([c.name, c.stack, c.image].join(' ').toLowerCase())}">
+                    <input type="checkbox" value="${escapeHtml(c.name)}" ${c.name === preselect ? 'checked' : ''}>
+                    <span class="min-w-0"><strong class="block text-sm text-white break-all">${escapeHtml(c.name)}</strong>
+                    <span class="block text-xs text-slate-400 break-all">${escapeHtml(c.stack)} · ${reasons[c.stack_source] || 'Automatic'} · ${escapeHtml(c.image)}</span></span>
+                </label>`).join('')}
+            </div>
+            <label class="block text-sm text-slate-300">Destination stack
+                <input id="stackDestination" maxlength="120" list="stackNames" class="w-full mt-1 p-2 rounded-lg bg-slate-950 border border-slate-700" placeholder="Choose a stack or type a new name">
+                <datalist id="stackNames">${Object.keys(data.stacks).sort().map(name => `<option value="${escapeHtml(name)}"></option>`).join('')}</datalist>
+            </label>
+            <div class="flex flex-wrap gap-2">
+                <button data-action="stack-assign" class="px-3 py-2 text-sm rounded-lg bg-indigo-600 text-white">Move selected</button>
+                <button data-action="stack-reset" class="px-3 py-2 text-sm rounded-lg bg-slate-800 text-slate-300">Use automatic grouping</button>
+            </div>
+            <p id="stackFeedback" role="status" class="text-xs text-amber-300"></p>
+        </div>`, 'fa-layer-group text-indigo-400', () => organizeStacks());
+    const search = document.getElementById('stackSearch');
+    search.addEventListener('input', () => {
+        const q = search.value.trim().toLowerCase();
+        document.querySelectorAll('.stack-choice').forEach(row => { row.hidden = !row.dataset.search.includes(q); });
+    });
+    document.getElementById('stackChoices').addEventListener('change', updateStackSelection);
+    updateStackSelection();
+}
+
+function updateStackSelection() {
+    const count = document.querySelectorAll('#stackChoices input:checked').length;
+    document.getElementById('stackSelection').textContent = `${count} selected`;
+}
+
+function assignStack(reset = false) {
+    const selected = [...document.querySelectorAll('#stackChoices input:checked')];
+    const destination = document.getElementById('stackDestination').value.trim();
+    if (!selected.length || (!reset && !destination)) {
+        document.getElementById('stackFeedback').textContent = !selected.length ? 'Select at least one container.' : 'Enter a stack name.';
+        return;
+    }
+    const previous = new Map(stackAssignments);
+    selected.forEach(input => { if (reset) stackAssignments.delete(input.value); else stackAssignments.set(input.value, destination); });
+    // A saved organization should never silently disappear after a reload.
+    if (!savePreferences()) {
+        stackAssignments.clear();
+        previous.forEach((value, key) => stackAssignments.set(key, value));
+        document.getElementById('stackFeedback').textContent = 'Could not save. Allow browser storage and try again.';
+        return;
+    }
+    if (!reset) expandedStacks.add(destination);
+    renderDashboard();
+    updateTopKPIs(dashboardData());
+    closeModal();
+}
+
+// Stable list ordering state
+const renderedStacks = new Map();
+let currentStackOrder = [];
+let pendingStackOrder = null;
+let lastOrderEvalTime = 0;
+let isPointerOverList = false;
+let hasInitialRendered = false;
+
+function isUserEngaged() {
+    const hasExpanded = expandedStacks.size > 0;
+    const modalOpen = !document.getElementById('modalOverlay').classList.contains('hidden');
+    const hasOpenUsage = (typeof openStackUsages !== 'undefined' && openStackUsages.size > 0);
+    return hasExpanded || modalOpen || hasOpenUsage || isPointerOverList;
+}
+
+function updateOrderPausedPill() {
+    const pill = document.getElementById('orderPausedPill');
+    if (!pill) return;
+    const shouldShow = Boolean(pendingStackOrder && isUserEngaged());
+    pill.hidden = !shouldShow;
+}
+
+function checkAutoResort() {
+    if (!isUserEngaged() && pendingStackOrder) {
+        renderDashboard(true);
+    }
+}
+
+function hysteresisSort(items, prevKeyOrder, sortBy) {
+    if (sortBy === 'name') {
+        return [...items].sort((a, b) => a.name.localeCompare(b.name));
+    }
+    const getVal = item => {
+        if (sortBy === 'cpu') return item.total_cpu ?? item.cpu_perc ?? 0;
+        if (sortBy === 'mem') return item.total_mem_bytes ?? item.mem_used_bytes ?? 0;
+        if (sortBy === 'containers') return item.total_containers ?? 1;
+        return 0;
+    };
+    const prevIndexMap = new Map();
+    (prevKeyOrder || []).forEach((key, idx) => prevIndexMap.set(key, idx));
+
+    const sorted = [...items];
+    sorted.sort((a, b) => {
+        const hasA = prevIndexMap.has(a.key);
+        const hasB = prevIndexMap.has(b.key);
+        if (hasA && hasB) return prevIndexMap.get(a.key) - prevIndexMap.get(b.key);
+        if (hasA) return -1;
+        if (hasB) return 1;
+        return getVal(b) - getVal(a) || a.name.localeCompare(b.name);
+    });
+
+    let changed = true;
+    let maxPasses = sorted.length;
+    while (changed && maxPasses-- > 0) {
+        changed = false;
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const a = sorted[i];
+            const b = sorted[i + 1];
+            const valA = getVal(a);
+            const valB = getVal(b);
+
+            const margin = sortBy === 'cpu' ? Math.max(valA * 0.10, 0.05) :
+                           sortBy === 'mem' ? valA * 0.10 :
+                           sortBy === 'containers' ? 0.5 : 0;
+            const overtakes = (valB - valA) > margin;
+            const tiedAndNameWins = (valA === valB) && (b.name.localeCompare(a.name) < 0);
+
+            if (overtakes || tiedAndNameWins) {
+                sorted[i] = b;
+                sorted[i + 1] = a;
+                changed = true;
+            }
+        }
+    }
+    return sorted;
+}
+
+function createStackNode(key) {
+    const section = document.createElement('section');
+    section.className = 'stack-group';
+    section.dataset.stackKey = key;
+
+    const row = document.createElement('div');
+    row.className = 'stack-row';
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', '0');
+    row.dataset.action = 'stack';
+    row.dataset.value = key;
+
+    const nameCol = document.createElement('div');
+    nameCol.className = 'stack-name';
+    const dot = document.createElement('span');
+    dot.className = 'state-dot';
+    const title = document.createElement('h2');
+    title.className = 'stack-title';
+    const count = document.createElement('span');
+    count.className = 'stack-count';
+    nameCol.append(dot, title, count);
+
+    const cpuMetric = document.createElement('div');
+    cpuMetric.className = 'row-metric';
+    const cpuVal = document.createElement('span');
+    cpuVal.className = 'row-val';
+    const cpuThinBar = document.createElement('span');
+    cpuThinBar.className = 'thin-bar';
+    const cpuBar = document.createElement('span');
+    cpuThinBar.appendChild(cpuBar);
+    cpuMetric.append(cpuVal, cpuThinBar);
+
+    const memMetric = document.createElement('div');
+    memMetric.className = 'row-metric';
+    const memVal = document.createElement('span');
+    memVal.className = 'row-val';
+    const memThinBar = document.createElement('span');
+    memThinBar.className = 'thin-bar';
+    const memBar = document.createElement('span');
+    memThinBar.appendChild(memBar);
+    memMetric.append(memVal, memThinBar);
+
+    const actionsCol = document.createElement('div');
+    actionsCol.className = 'stack-actions';
+
+    const chevron = document.createElement('span');
+    chevron.className = 'stack-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.innerHTML = '<i class="fa-solid fa-chevron-right"></i>';
+
+    row.append(nameCol, cpuMetric, memMetric, actionsCol, chevron);
+
+    const usagePanel = document.createElement('div');
+    usagePanel.className = 'stack-usage-panel';
+    usagePanel.hidden = true;
+
+    const containersWrap = document.createElement('div');
+    containersWrap.className = 'stack-containers';
+    containersWrap.hidden = true;
+
+    section.append(row, usagePanel, containersWrap);
+
+    return {
+        section,
+        row,
+        dot,
+        title,
+        count,
+        cpuMetric,
+        cpuVal,
+        cpuBar,
+        memMetric,
+        memVal,
+        memBar,
+        actionsCol,
+        chevron,
+        usagePanel,
+        containersWrap,
+        containers: new Map(),
+        containerOrder: []
+    };
+}
+
+function createContainerNode(name) {
+    const row = document.createElement('div');
+    row.className = 'container-row';
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', '0');
+    row.dataset.action = 'inspect';
+    row.dataset.value = name;
+    row.dataset.containerKey = name;
+
+    const nameCol = document.createElement('div');
+    nameCol.className = 'container-col-name';
+    const dot = document.createElement('span');
+    dot.className = 'state-dot';
+    const title = document.createElement('strong');
+    title.className = 'container-title';
+    const stateLabel = document.createElement('span');
+    stateLabel.className = 'container-state-label';
+    nameCol.append(dot, title, stateLabel);
+
+    const cpuMetric = document.createElement('div');
+    cpuMetric.className = 'row-metric';
+    const cpuVal = document.createElement('span');
+    cpuVal.className = 'row-val';
+    const cpuThinBar = document.createElement('span');
+    cpuThinBar.className = 'thin-bar';
+    const cpuBar = document.createElement('span');
+    cpuThinBar.appendChild(cpuBar);
+    cpuMetric.append(cpuVal, cpuThinBar);
+
+    const memMetric = document.createElement('div');
+    memMetric.className = 'row-metric';
+    const memVal = document.createElement('span');
+    memVal.className = 'row-val';
+    const memThinBar = document.createElement('span');
+    memThinBar.className = 'thin-bar';
+    const memBar = document.createElement('span');
+    memThinBar.appendChild(memBar);
+    memMetric.append(memVal, memThinBar);
+
+    const actionsCol = document.createElement('div');
+    actionsCol.className = 'container-actions';
+    const extraMeta = document.createElement('span');
+    extraMeta.className = 'container-extra-meta flex items-center gap-2 truncate';
+    const logsBtn = document.createElement('button');
+    logsBtn.className = 'container-btn-logs';
+    logsBtn.dataset.action = 'logs';
+    logsBtn.dataset.value = name;
+    logsBtn.textContent = 'Logs';
+    actionsCol.append(extraMeta, logsBtn);
+
+    const trigger = document.createElement('span');
+    trigger.className = 'container-drawer-trigger';
+    trigger.setAttribute('aria-hidden', 'true');
+    trigger.innerHTML = '&rsaquo;';
+
+    row.append(nameCol, cpuMetric, memMetric, actionsCol, trigger);
+
+    return {
+        row,
+        dot,
+        title,
+        stateLabel,
+        cpuMetric,
+        cpuVal,
+        cpuBar,
+        memMetric,
+        memVal,
+        memBar,
+        actionsCol,
+        extraMeta,
+        logsBtn,
+        trigger
+    };
+}
+
+function patchStackNode(node, stack, isExpanded, maxCpu, maxMemBytes, cpus, hostMemTotal) {
+    const state = stack.containers.some(needsAttention) ? 'warning' : stack.containers.some(isRunning) ? '' : 'inactive';
+    const cpuBarWidth = calcBarWidth(stack.total_cpu, maxCpu);
+    const memBarWidth = calcBarWidth(stack.total_mem_bytes, maxMemBytes);
+    const hostCpuPct = stack.total_cpu / cpus;
+    const hostMemPct = stack.host_mem_perc || (stack.total_mem_bytes / hostMemTotal * 100);
+
+    node.row.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+    node.dot.className = `state-dot ${state}`;
+    if (node.title.textContent !== stack.name) node.title.textContent = stack.name;
+    const countText = `${stack.displayContainers.length} containers`;
+    if (node.count.textContent !== countText) node.count.textContent = countText;
+
+    const cpuText = `${stack.total_cpu.toFixed(1)}%`;
+    if (node.cpuVal.textContent !== cpuText) node.cpuVal.textContent = cpuText;
+    const cpuHostText = Number.isFinite(hostCpuPct) ? ` (${hostCpuPct.toFixed(1)}% of host)` : '';
+    node.cpuMetric.title = `${cpuText}${cpuHostText}`;
+    node.cpuBar.style.width = `${Math.max(0, Math.min(100, cpuBarWidth))}%`;
+    node.cpuBar.className = hostCpuPct > 25 ? 'warning' : '';
+
+    const memText = formatBytesNoDec(stack.total_mem_bytes);
+    if (node.memVal.textContent !== memText) node.memVal.textContent = memText;
+    const memHostText = Number.isFinite(hostMemPct) ? ` (${hostMemPct.toFixed(1)}% of host)` : '';
+    node.memMetric.title = `${memText}${memHostText}`;
+    node.memBar.style.width = `${Math.max(0, Math.min(100, memBarWidth))}%`;
+    node.memBar.className = hostMemPct > 25 ? 'warning' : '';
+
+    node.containersWrap.hidden = !isExpanded;
+}
+
+function patchContainerNode(node, container, maxCpu, maxMemBytes, cpus, hostMemTotal) {
+    const state = needsAttention(container) ? 'warning' : isRunning(container) ? '' : 'inactive';
+    const cCpuBarWidth = container.cpu_perc > 0 ? Math.max(3, Math.min(100, (container.cpu_perc / maxCpu) * 100)) : 0;
+    const cMemBarWidth = container.mem_used_bytes > 0 ? Math.max(3, Math.min(100, (container.mem_used_bytes / maxMemBytes) * 100)) : 0;
+    const cHostCpuPct = container.cpu_perc / cpus;
+    const cHostMemPct = (container.mem_used_bytes / hostMemTotal) * 100;
+
+    node.dot.className = `state-dot ${state}`;
+    const displayName = container.display_name || container.name;
+    if (node.title.textContent !== displayName) node.title.textContent = displayName;
+    const stateText = isStopped(container) ? 'stopped' : (container.health || container.state || '');
+    if (node.stateLabel.textContent !== stateText) node.stateLabel.textContent = stateText;
+
+    const cpuText = `${container.cpu_perc.toFixed(1)}%`;
+    if (node.cpuVal.textContent !== cpuText) node.cpuVal.textContent = cpuText;
+    const cpuHostText = Number.isFinite(cHostCpuPct) ? ` (${cHostCpuPct.toFixed(1)}% of host)` : '';
+    node.cpuMetric.title = `${cpuText}${cpuHostText}`;
+    node.cpuBar.style.width = `${Math.max(0, Math.min(100, cCpuBarWidth))}%`;
+    node.cpuBar.className = cHostCpuPct > 25 ? 'warning' : '';
+
+    const memText = container.mem_used_formatted || '0 B';
+    if (node.memVal.textContent !== memText) node.memVal.textContent = memText;
+    const memHostText = Number.isFinite(cHostMemPct) ? ` (${cHostMemPct.toFixed(1)}% of host)` : '';
+    node.memMetric.title = `${memText}${memHostText}`;
+    node.memBar.style.width = `${Math.max(0, Math.min(100, cMemBarWidth))}%`;
+    node.memBar.className = cHostMemPct > 25 ? 'warning' : '';
+
+    let extraHtml = '';
+    if (container.gpu_stats_available) {
+        const gpuPct = container.gpu_perc == null ? 'Unavailable' : `${container.gpu_perc.toFixed(1)}%`;
+        const vram = container.gpu_memory_bytes == null ? 'Unavailable' : formatBytesNoDec(container.gpu_memory_bytes);
+        extraHtml += `<span class="container-gpu-meta">GPU ${escapeHtml(gpuPct)} · VRAM ${escapeHtml(vram)}</span>`;
+    }
+    if (container.ports) {
+        const portLinks = container.ports.split(',').filter(Boolean).map(port => {
+            const match = port.match(/(?:^|:)(\d+)->/);
+            return match ? `<a href="${escapeHtml(portUrl(match[1]))}" target="_blank" rel="noopener noreferrer">${escapeHtml(port.trim())}</a>` : escapeHtml(port);
+        }).join(' · ');
+        if (portLinks) extraHtml += `<span class="container-ports-meta">${portLinks}</span>`;
+    }
+    if (container.url) {
+        extraHtml += `<a href="${escapeHtml(container.url)}" target="_blank" rel="noopener noreferrer" class="container-app-link">Open app</a>`;
+    }
+    if (node.extraMeta.innerHTML !== extraHtml) node.extraMeta.innerHTML = extraHtml;
+}
+
+function calcBarWidth(val, max) {
+    if (!val || val <= 0) return 0;
+    return Math.max(3, Math.min(100, (val / max) * 100));
+}
+
+function applyStackOrder(orderedKeys) {
+    const container = document.getElementById('stacksContainer');
+    if (!container) return;
+    const isReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const firstTops = new Map();
+    if (!isReduced) {
+        for (const child of container.children) {
+            if (child.dataset && child.dataset.stackKey) {
+                firstTops.set(child.dataset.stackKey, child.getBoundingClientRect().top);
+            }
+        }
+    }
+
+    for (const key of orderedKeys) {
+        const node = renderedStacks.get(key);
+        if (node && node.section) {
+            container.appendChild(node.section);
+        }
+    }
+    currentStackOrder = [...orderedKeys];
+
+    if (!isReduced) {
+        for (const child of container.children) {
+            const key = child.dataset?.stackKey;
+            if (key && firstTops.has(key)) {
+                const firstTop = firstTops.get(key);
+                const lastTop = child.getBoundingClientRect().top;
+                const deltaY = firstTop - lastTop;
+                if (Math.abs(deltaY) > 1) {
+                    child.style.transform = `translateY(${deltaY}px)`;
+                    child.style.transition = 'none';
+                    requestAnimationFrame(() => {
+                        child.style.transition = 'transform 200ms cubic-bezier(0.2, 0, 0, 1)';
+                        child.style.transform = '';
+                        const cleanup = () => {
+                            child.style.transition = '';
+                            child.removeEventListener('transitionend', cleanup);
+                        };
+                        child.addEventListener('transitionend', cleanup, { once: true });
+                    });
+                }
+            }
+        }
+    }
+}
+
+function renderDashboard(forceOrder = false) {
+    const view = dashboardData();
     if (!latestData || !view.stacks) return;
 
     savePreferences();
@@ -789,6 +1337,7 @@ function renderDashboard() {
         const matchingContainers = s.containers.filter(c => {
             const matchesSearch = matchesStack ||
                    c.name.toLowerCase().includes(q) ||
+                   (c.display_name || '').toLowerCase().includes(q) ||
                    c.image.toLowerCase().includes(q) ||
                    c.service.toLowerCase().includes(q) ||
                    (c.storage_tier && c.storage_tier.toLowerCase().includes(q)) ||
@@ -796,13 +1345,7 @@ function renderDashboard() {
 
             if (!matchesSearch) return false;
 
-            if (activeQuickFilter === 'issues') return ['unhealthy', 'exited', 'dead', 'restarting'].includes(c.health);
-            if (activeQuickFilter === 'cpu') return c.cpu_perc >= 0.5;
-            if (activeQuickFilter === 'mem') return c.mem_used_bytes >= (250 * 1024 * 1024);
-            if (activeQuickFilter === 'ports') return Boolean(c.ports && c.ports.trim().length > 0);
-            if (activeQuickFilter === 'secondary') return Boolean(c.storage_tier && c.storage_tier.includes('Secondary'));
-            if (activeQuickFilter === 'root') return Boolean(c.storage_tier && c.storage_tier.includes('Root') && !c.storage_tier.includes('Secondary'));
-            return true;
+            return matchesQuickFilter(c, activeQuickFilter);
         });
 
         if (matchingContainers.length > 0) {
@@ -814,16 +1357,6 @@ function renderDashboard() {
         }
     }
 
-    if (sortBy === 'cpu') {
-        filtered.sort((a, b) => b.total_cpu - a.total_cpu);
-    } else if (sortBy === 'mem') {
-        filtered.sort((a, b) => b.total_mem_bytes - a.total_mem_bytes);
-    } else if (sortBy === 'containers') {
-        filtered.sort((a, b) => b.total_containers - a.total_containers);
-    } else if (sortBy === 'name') {
-        filtered.sort((a, b) => a.name.localeCompare(b.name));
-    }
-
     if (filtered.length === 0) {
         containerEl.innerHTML = `
             <div class="glass-card rounded-2xl p-12 text-center text-slate-400">
@@ -832,212 +1365,260 @@ function renderDashboard() {
                 <p class="text-xs text-slate-500 mt-1">Try resetting search filters or selecting another quick filter</p>
             </div>
         `;
+        renderedStacks.clear();
+        currentStackOrder = [];
+        pendingStackOrder = null;
+        updateOrderPausedPill();
         return;
     }
 
-    let html = '';
-    for (const stack of filtered) {
-        const isExpanded = (q && q.length > 0) || expandedStacks.has(stack.key);
-        const sIcon = getStackIcon(stack.name);
-        const totalMem = stack.total_mem_formatted || formatBytesNoDec(stack.total_mem_bytes);
-
-        html += `
-        <div class="glass-card rounded-2xl overflow-hidden border border-slate-800 transition">
-            <!-- Stack Header / Accordion trigger -->
-            <div role="button" tabindex="0" data-action="stack" data-value="${escapeHtml(stack.key)}"
-                 class="p-3.5 bg-slate-900/80 hover:bg-slate-850/90 cursor-pointer flex flex-col md:flex-row md:items-center justify-between gap-3 select-none">
-                <div class="flex items-center gap-3">
-                    <div class="w-8 h-8 rounded-xl ${sIcon.bg} ${sIcon.border} border flex items-center justify-center ${sIcon.color}">
-                        <i class="fa-solid ${sIcon.icon} text-sm"></i>
-                    </div>
-                    <div>
-                        <div class="flex items-center gap-2">
-                            <h2 class="text-base font-bold text-white tracking-tight">${stack.name}</h2>
-                            <span class="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-0.5 rounded-full border border-slate-700/60">
-                                ${stack.displayContainers.length}${stack.displayContainers.length !== stack.total_containers ? ` of ${stack.total_containers}` : ''} containers
-                            </span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="flex items-center gap-4 text-xs font-mono">
-                    <div class="flex items-center gap-1.5 text-slate-300">
-                        <i class="fa-solid fa-microchip text-amber-400 text-[11px]"></i>
-                        <span>${stack.total_cpu.toFixed(1)}% CPU</span>
-                    </div>
-                    <div class="flex items-center gap-1.5 text-slate-300">
-                        <i class="fa-solid fa-memory text-purple-400 text-[11px]"></i>
-                        <span>${totalMem} RAM</span>
-                        <span class="text-slate-500 text-[10px]">(${stack.docker_mem_share || 0}% Docker)</span>
-                    </div>
-                    <div class="text-slate-400 pl-2">
-                        <i class="fa-solid fa-chevron-${isExpanded ? 'up' : 'down'} text-xs text-slate-500"></i>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Containers List -->
-            ${isExpanded ? `
-            <div class="divide-y divide-slate-800/80 border-t border-slate-800/80">
-                ${stack.displayContainers.map(c => renderContainerRow(c, stack)).join('')}
-            </div>
-            ` : ''}
-        </div>
-        `;
+    // Clear empty state message if it was shown
+    const emptyState = containerEl.querySelector('.glass-card');
+    if (emptyState) {
+        containerEl.innerHTML = '';
+        renderedStacks.clear();
+        currentStackOrder = [];
     }
 
-    containerEl.innerHTML = html;
+    // Determine the heaviest visible row for bar scaling
+    let maxCpu = 0;
+    let maxMemBytes = 0;
+    const cpus = latestData.system?.cpus || 1;
+    const hostMemTotal = latestData.system?.mem_total_bytes || 1;
+
+    for (const stack of filtered) {
+        if (stack.total_cpu > maxCpu) maxCpu = stack.total_cpu;
+        if (stack.total_mem_bytes > maxMemBytes) maxMemBytes = stack.total_mem_bytes;
+        const isExp = (q && q.length > 0) || expandedStacks.has(stack.key);
+        if (isExp) {
+            for (const c of stack.displayContainers) {
+                if (c.cpu_perc > maxCpu) maxCpu = c.cpu_perc;
+                if (c.mem_used_bytes > maxMemBytes) maxMemBytes = c.mem_used_bytes;
+            }
+        }
+    }
+    if (maxCpu <= 0) maxCpu = 1;
+    if (maxMemBytes <= 0) maxMemBytes = 1;
+
+    // Prune removed stacks from DOM & map
+    const activeStackKeys = new Set(filtered.map(s => s.key));
+    for (const [key, node] of renderedStacks.entries()) {
+        if (!activeStackKeys.has(key)) {
+            node.section.remove();
+            renderedStacks.delete(key);
+        }
+    }
+
+    // Patch or create stack & container DOM elements
+    for (const stack of filtered) {
+        let node = renderedStacks.get(stack.key);
+        if (!node) {
+            node = createStackNode(stack.key);
+            renderedStacks.set(stack.key, node);
+            containerEl.appendChild(node.section);
+        }
+
+        const isExpanded = (q && q.length > 0) || expandedStacks.has(stack.key);
+        patchStackNode(node, stack, isExpanded, maxCpu, maxMemBytes, cpus, hostMemTotal);
+
+        if (isExpanded) {
+            // Update container rows inside stack
+            const activeContainerKeys = new Set(stack.displayContainers.map(c => c.name));
+            for (const [cName, cNode] of node.containers.entries()) {
+                if (!activeContainerKeys.has(cName)) {
+                    cNode.row.remove();
+                    node.containers.delete(cName);
+                }
+            }
+
+            // Containers stable sort
+            const sortedContainers = hysteresisSort(
+                stack.displayContainers.map(c => ({ ...c, key: c.name })),
+                node.containerOrder,
+                sortBy === 'name' ? 'name' : 'cpu'
+            );
+            node.containerOrder = sortedContainers.map(c => c.key);
+
+            for (let i = 0; i < sortedContainers.length; i++) {
+                const c = sortedContainers[i];
+                let cNode = node.containers.get(c.name);
+                if (!cNode) {
+                    cNode = createContainerNode(c.name);
+                    node.containers.set(c.name, cNode);
+                    node.containersWrap.appendChild(cNode.row);
+                }
+                patchContainerNode(cNode, c, maxCpu, maxMemBytes, cpus, hostMemTotal);
+                if (node.containersWrap.children[i] !== cNode.row) {
+                    node.containersWrap.appendChild(cNode.row);
+                }
+            }
+        } else if (node.containers.size > 0) {
+            node.containersWrap.replaceChildren();
+            node.containers.clear();
+            node.containerOrder = [];
+        }
+    }
+
+    // Expand/collapse button state
+    const allExpanded = Object.keys(view.stacks).every(key => expandedStacks.has(key));
+    const expand = document.getElementById('expandAll');
+    if (expand) {
+        expand.setAttribute('aria-label', allExpanded ? 'Collapse all stacks' : 'Expand all stacks');
+        expand.title = expand.getAttribute('aria-label');
+        expand.textContent = allExpanded ? '−' : '↕';
+    }
+
+    // Ordering evaluation (decoupled from refresh)
+    const idealStacks = hysteresisSort(filtered, currentStackOrder, sortBy);
+    const idealKeys = idealStacks.map(s => s.key);
+    const now = Date.now();
+
+    if (!hasInitialRendered || forceOrder) {
+        applyStackOrder(idealKeys);
+        lastOrderEvalTime = now;
+        pendingStackOrder = null;
+        hasInitialRendered = true;
+        updateOrderPausedPill();
+    } else {
+        const orderChanged = idealKeys.length !== currentStackOrder.length || idealKeys.some((k, i) => k !== currentStackOrder[i]);
+        if (orderChanged) {
+            if (isUserEngaged()) {
+                pendingStackOrder = idealKeys;
+                updateOrderPausedPill();
+            } else if (now - lastOrderEvalTime >= 10000) {
+                applyStackOrder(idealKeys);
+                lastOrderEvalTime = now;
+                pendingStackOrder = null;
+                updateOrderPausedPill();
+            }
+        } else {
+            pendingStackOrder = null;
+            updateOrderPausedPill();
+            if (now - lastOrderEvalTime >= 10000) lastOrderEvalTime = now;
+        }
+    }
 }
 
-function renderContainerRow(c, stack) {
-    const h = getHealthBadge(c.health);
+// Stopped containers may be retired, manually stopped, or completed jobs.
+// A stop alone does not establish a failure or an expectation to keep running.
+function needsAttention(c) { return ['unhealthy','dead','restarting'].includes(c.health); }
+function isRunning(c) { return c.state === 'running' || (!c.state && ['healthy','running','unhealthy','starting'].includes(c.health)); }
+function isStopped(c) { return (c.state || c.health) === 'exited'; }
+function matchesQuickFilter(c, filter) {
+    if (filter === 'issues') return needsAttention(c);
+    if (filter === 'running') return isRunning(c);
+    if (filter === 'stopped') return isStopped(c);
+    if (filter === 'paused') return (c.state || c.health) === 'paused';
+    if (filter === 'starting') return c.health === 'starting' || (c.state || c.health) === 'created';
+    if (filter === 'ports') return /->/.test(c.ports || '');
+    return true;
+}
+function rowMetric(label, barWidthPct, hostPct, isHigh) {
+    const width = Math.max(0, Math.min(100, barWidthPct || 0));
+    const hostText = Number.isFinite(hostPct) ? `${hostPct.toFixed(1)}% of host` : '';
+    const tooltip = hostText ? `${label} (${hostText})` : label;
+    const barClass = isHigh ? 'warning' : '';
+    return `<div class="row-metric" title="${escapeHtml(tooltip)}"><span>${escapeHtml(label)}</span><span class="thin-bar"><span class="${barClass}" style="width:${width}%"></span></span></div>`;
+}
+function renderContainerRow(container, maxCpu, maxMemBytes) {
+    const c = escapedView(container);
+    const cpus = latestData.system?.cpus || 1;
+    const hostMemTotal = latestData.system?.mem_total_bytes || 1;
+    const cCpuBarWidth = container.cpu_perc > 0 ? Math.max(3, Math.min(100, (container.cpu_perc / maxCpu) * 100)) : 0;
+    const cMemBarWidth = container.mem_used_bytes > 0 ? Math.max(3, Math.min(100, (container.mem_used_bytes / maxMemBytes) * 100)) : 0;
+    const cHostCpuPct = container.cpu_perc / cpus;
+    const cHostMemPct = (container.mem_used_bytes / hostMemTotal) * 100;
 
-    // Format ports nicely with links
-    let portsHtml = '';
-    if (c.ports) {
-        const portItems = c.ports.split(',').map(p => p.trim()).filter(Boolean);
-        portsHtml = portItems.map(p => {
-            const match = p.match(/(?:^|:)(\d+)-(?:>|&gt;)/);
-            if (match) {
-                const portNum = match[1];
-                return `<a href="${escapeHtml(portUrl(portNum))}" target="_blank" rel="noopener noreferrer" title="Open port in browser" class="text-cyan-400 hover:text-cyan-300 hover:underline bg-cyan-950/60 border border-cyan-800/40 px-1.5 py-0.5 rounded text-[11px] font-mono flex items-center gap-1"><i class="fa-solid fa-arrow-up-right-from-square text-[9px]"></i>${portNum}</a>`;
-            }
-            return `<span class="text-slate-400 bg-slate-800/70 border border-slate-700/50 px-1.5 py-0.5 rounded text-[11px] font-mono">${p}</span>`;
-        }).join('');
-    }
-
-    // CPU Meter calculations
-    const cpuBarWidth = Math.min(100, Math.max(2, (c.cpu_perc / 100) * 100));
-    const cpuColor = c.cpu_perc > 50 ? 'bg-rose-500' : (c.cpu_perc > 10 ? 'bg-amber-400' : 'bg-amber-400/80');
-
-    // RAM Meter calculations
-    let memBarWidth = 2;
-    let memBarLabel = c.mem_used_formatted || '0 B';
-    let memSubLabel = '';
-    let memColor = 'bg-purple-500';
-
-    if (c.has_custom_limit) {
-        memBarWidth = Math.min(100, Math.max(2, c.mem_perc || 0));
-        memSubLabel = `${Math.round(c.mem_perc)}% of ${c.mem_limit_formatted}`;
-        if (c.mem_perc > 85) memColor = 'bg-rose-500';
-    } else {
-        const shareOfStack = stack.total_mem_bytes > 0 ? Math.round((c.mem_used_bytes / stack.total_mem_bytes) * 100) : 0;
-        memBarWidth = Math.min(100, Math.max(2, shareOfStack));
-        memSubLabel = `${shareOfStack}% of stack`;
-    }
-
-    return `
-    <div class="p-3.5 hover:bg-slate-900/50 transition flex flex-col xl:flex-row xl:items-center justify-between gap-3">
-        <!-- Info Column -->
-        <div class="flex-1 min-w-0 space-y-1">
-            <div class="flex items-center gap-2 flex-wrap">
-                <span class="w-2.5 h-2.5 rounded-full ${h.color === 'text-emerald-400' ? 'bg-emerald-400' : (h.color === 'text-blue-400' ? 'bg-blue-400' : (h.color === 'text-rose-400' ? 'bg-rose-400' : 'bg-slate-500'))} inline-block shrink-0 shadow-sm" title="${h.label}"></span>
-                <h3 class="text-sm font-bold text-white truncate max-w-md hover:text-indigo-400 transition cursor-pointer" data-action="inspect" data-value="${c.name}">
-                    <i class="fa-solid ${c.icon || 'fa-cube'} text-slate-400"></i> ${c.display_name || c.name}
-                </h3>
-                <span class="text-[10px] font-mono text-slate-400 bg-slate-800/80 border border-slate-700/60 px-1.5 py-0.5 rounded">
-                    ${c.id}
-                </span>
-                <span class="text-[11px] font-medium px-2 py-0.5 rounded-full ${h.bg} ${h.color} ${h.border} border flex items-center gap-1">
-                    <i class="fa-solid ${h.icon} text-[10px]"></i> ${h.label}
-                </span>
-                ${c.service && c.service !== c.name ? `
-                <span class="text-[10px] text-slate-400 bg-slate-900 border border-slate-800 px-2 py-0.5 rounded font-mono">
-                    svc: ${c.service}
-                </span>
-                ` : ''}
-            </div>
-
-            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
-                <span class="truncate max-w-sm text-slate-400" title="${c.image}">
-                    <i class="fa-solid fa-box text-slate-500 mr-1"></i> ${c.image}
-                </span>
-                <span><i class="fa-regular fa-clock text-slate-500 mr-1"></i> ${c.created}</span>
-                ${portsHtml ? `<div class="flex flex-wrap items-center gap-1.5">${portsHtml}</div>` : ''}
-            </div>
+    return `<div class="container-row" role="button" tabindex="0" data-action="inspect" data-value="${escapeHtml(c.name)}">
+        <div class="container-col-name">
+            <span class="state-dot ${needsAttention(container) ? 'warning' : isRunning(container) ? '' : 'inactive'}"></span>
+            <strong class="container-title">${escapeHtml(c.display_name || c.name)}</strong>
+            <span class="container-state-label">${escapeHtml(isStopped(container) ? 'stopped' : (c.health || c.state || ''))}</span>
         </div>
-
-        <!-- Metrics Grid -->
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-2.5 w-full xl:w-auto xl:min-w-[580px] shrink-0">
-            <!-- CPU Meter -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="flex items-center justify-between text-xs mb-1">
-                    <span class="text-slate-400 text-[11px] flex items-center gap-1 font-medium shrink-0"><i class="fa-solid fa-microchip text-[10px] text-amber-400"></i> CPU</span>
-                    <span class="text-slate-200 font-bold metric-badge font-mono truncate ml-1">${c.cpu_perc.toFixed(1)}%</span>
-                </div>
-                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                    <div class="${cpuColor} h-1.5 rounded-full progress-bar-smooth" style="width: ${cpuBarWidth}%"></div>
-                </div>
-                <div class="text-[10px] text-slate-400 mt-1 font-mono">PIDs: ${c.pids}</div>
-            </div>
-
-            <!-- RAM Meter -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="flex items-center justify-between text-xs mb-1">
-                    <span class="text-slate-400 text-[11px] flex items-center gap-1 font-medium shrink-0"><i class="fa-solid fa-memory text-[10px] text-purple-400"></i> RAM</span>
-                    <span class="text-slate-200 font-bold metric-badge font-mono truncate ml-1">${memBarLabel}</span>
-                </div>
-                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                    <div class="${memColor} h-1.5 rounded-full progress-bar-smooth" style="width: ${memBarWidth}%"></div>
-                </div>
-                <div class="text-[10px] text-slate-400 mt-1 font-mono truncate" title="${memSubLabel}">${memSubLabel}</div>
-            </div>
-
-            <!-- Disk Block I/O -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="text-[11px] text-slate-400 flex items-center justify-between font-medium mb-1">
-                    <span class="flex items-center gap-1 shrink-0"><i class="fa-solid fa-hard-drive text-[10px] text-cyan-400"></i> I/O</span>
-                    <span class="text-[10px] font-mono text-slate-400 truncate ml-1">${c.storage_tier || 'Root'}</span>
-                </div>
-                <div class="text-[10px] font-mono space-y-0.5">
-                    <div class="flex justify-between text-slate-400">
-                        <span>Read:</span> <span class="text-slate-200 font-semibold truncate ml-1">${c.block_read}</span>
-                    </div>
-                    <div class="flex justify-between text-slate-400">
-                        <span>Write:</span> <span class="text-cyan-300 font-semibold truncate ml-1">${c.block_write}</span>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Net I/O -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="text-[11px] text-slate-400 flex items-center gap-1 font-medium mb-1">
-                    <i class="fa-solid fa-arrow-right-arrow-left text-[10px] text-emerald-400"></i> Net
-                </div>
-                <div class="text-[10px] font-mono space-y-0.5">
-                    <div class="flex justify-between text-slate-400">
-                        <span>Down:</span> <span class="text-emerald-400 font-semibold truncate ml-1">${c.net_rx}</span>
-                    </div>
-                    <div class="flex justify-between text-slate-400">
-                        <span>Up:</span> <span class="text-indigo-300 font-semibold truncate ml-1">${c.net_tx}</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Action Buttons -->
-        ${c.url ? `<a href="${c.url}" target="_blank" rel="noopener noreferrer" class="text-xs text-cyan-300 hover:underline">Open app</a>` : ''}
-        ${c.state === 'running' && !c.stats_available ? '<span class="text-xs text-amber-300">Metrics unavailable</span>' : ''}
-        <div class="flex items-center gap-1.5 xl:flex-col xl:items-end shrink-0">
-            <button data-action="inspect" data-value="${c.name}" class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1 cursor-pointer">
-                <i class="fa-solid fa-circle-info text-indigo-400"></i> Details
-            </button>
-            <button data-action="logs" data-value="${c.name}" class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1 cursor-pointer">
-                <i class="fa-solid fa-terminal text-cyan-400"></i> Logs
-            </button>
-        </div>
-    </div>
-    `;
+        ${rowMetric(`${c.cpu_perc.toFixed(1)}%`, cCpuBarWidth, cHostCpuPct, cHostCpuPct > 25)}
+        ${rowMetric(c.mem_used_formatted || '0 B', cMemBarWidth, cHostMemPct, cHostMemPct > 25)}
+        <div></div>
+        <span class="container-drawer-trigger" aria-hidden="true">&rsaquo;</span>
+    </div>`;
 }
 
 async function inspectContainer(name) {
-    openModal(
-        `Container Details: ${name}`,
-        'Fetching secure inspection data from Docker...',
-        '<div class="text-center py-8 text-slate-400"><i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500 mb-2"></i><p>Loading configuration...</p></div>',
-        'fa-circle-info text-indigo-400',
-        () => inspectContainer(name)
-    );
+    const c = findContainer(name);
+    const displayName = c ? (c.display_name || c.name) : name;
+    const title = displayName;
+    const subtitle = c ? `${c.stack} · ${isStopped(c) ? 'Stopped' : (c.health || c.state || 'Running')}` : 'Container details';
+
+    const formattedImage = c ? formatImageName(c.image) : '—';
+    const portsHtml = c ? renderPortChips(c.ports) : '<span class="muted text-xs">No ports published</span>';
+    const netRx = c?.net_rx || '—';
+    const netTx = c?.net_tx || '—';
+    const cpuStr = c ? `${c.cpu_perc.toFixed(1)}%` : '—';
+    const ramStr = c ? (c.mem_used_formatted || '0 B') : '—';
+
+    const initialContent = `
+        <div class="space-y-3">
+            <div class="drawer-section">
+                <div class="flex items-center justify-between mb-3">
+                    <span class="drawer-section-title"><i class="fa-solid fa-gauge-high text-indigo-400"></i> Status &amp; Performance</span>
+                    <button data-action="logs" data-value="${escapeHtml(name)}" class="drawer-btn-logs"><i class="fa-solid fa-terminal text-cyan-400"></i> Logs</button>
+                </div>
+                <div class="drawer-grid-4">
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">Exit Code</div>
+                        <div id="drawerExitCode" class="drawer-stat-value">${c && isStopped(c) ? 'Checking…' : '0'}</div>
+                    </div>
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">Restarts</div>
+                        <div id="drawerRestarts" class="drawer-stat-value">Checking…</div>
+                    </div>
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">CPU</div>
+                        <div class="drawer-stat-value">${escapeHtml(cpuStr)}</div>
+                    </div>
+                    <div class="drawer-stat-box">
+                        <div class="drawer-stat-label">RAM</div>
+                        <div class="drawer-stat-value">${escapeHtml(ramStr)}</div>
+                    </div>
+                </div>
+                <div class="mt-2 text-xs font-mono text-slate-400">
+                    <span>OOM killed: <strong id="drawerOomKilled" class="text-slate-300">Checking…</strong></span>
+                </div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-box text-purple-400"></i> Image</div>
+                <div class="flex items-center justify-between gap-2 p-2 bg-slate-950 rounded-lg border border-slate-800">
+                    <code class="text-xs font-mono text-purple-300 break-all select-all">${escapeHtml(formattedImage)}</code>
+                    <button data-action="copy" data-value="${escapeHtml(formattedImage)}" class="text-xs px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/60 shrink-0">Copy</button>
+                </div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-network-wired text-cyan-400"></i> Published Ports</div>
+                <div class="flex flex-wrap gap-1.5">${portsHtml}</div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-arrow-right-arrow-left text-emerald-400"></i> Network I/O</div>
+                <div class="flex items-center gap-4 text-xs font-mono text-slate-300 p-2 bg-slate-950 rounded-lg border border-slate-800">
+                    <span><i class="fa-solid fa-arrow-down text-emerald-400"></i> Received: <strong>${escapeHtml(netRx)}</strong></span>
+                    <span><i class="fa-solid fa-arrow-up text-cyan-400"></i> Transmitted: <strong>${escapeHtml(netTx)}</strong></span>
+                </div>
+                <div id="drawerNetworks" class="mt-2 space-y-1 text-xs font-mono text-slate-400">
+                    <p class="text-[11px] text-slate-500">Inspecting networks…</p>
+                </div>
+            </div>
+
+            <div class="drawer-section">
+                <div class="drawer-section-title"><i class="fa-solid fa-folder-tree text-amber-400"></i> Mounts &amp; Volumes</div>
+                <div id="drawerMounts" class="space-y-1.5">
+                    <p class="text-[11px] text-slate-500">Inspecting mounts…</p>
+                </div>
+            </div>
+        </div>
+    `;
+
+    openModal(title, subtitle, initialContent, 'fa-cube text-indigo-400', () => inspectContainer(name));
 
     const generation = modalGeneration;
     try {
@@ -1050,81 +1631,45 @@ async function inspectContainer(name) {
         const mounts = data.Mounts || [];
         const net = (data.NetworkSettings && data.NetworkSettings.Networks) ? data.NetworkSettings.Networks : {};
 
-        let mountsHtml = mounts.map(m => {
-            const isSecondary = (m.Source || '').includes('/srv/data') || (m.Source || '').includes('/data') || (m.Source || '').includes('/mnt');
-            const diskBadge = isSecondary
-                ? '<span class="text-[10px] px-2 py-0.5 rounded bg-emerald-950/80 text-emerald-300 font-mono border border-emerald-800/40 font-semibold flex items-center gap-1"><i class="fa-solid fa-hard-drive text-[9px]"></i>Secondary Storage</span>'
-                : '<span class="text-[10px] px-2 py-0.5 rounded bg-cyan-950/80 text-cyan-300 font-mono border border-cyan-800/40 font-semibold flex items-center gap-1"><i class="fa-solid fa-bolt text-[9px]"></i>System Storage</span>';
-            return `
-            <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                <div class="flex items-center justify-between mb-1.5">
-                    <div class="flex items-center gap-2">
-                        <span class="text-indigo-400 font-bold uppercase text-[10px] tracking-wider bg-indigo-950/60 px-1.5 py-0.5 rounded border border-indigo-800/40">${m.Type || 'mount'}</span>
-                        <span class="text-xs text-slate-500 font-mono">Mode: ${m.RW ? 'Read-Write (RW)' : 'Read-Only (RO)'}</span>
-                    </div>
-                    ${diskBadge}
-                </div>
-                <div class="text-slate-300 font-mono text-xs break-all">${m.Source}</div>
-                <div class="text-cyan-400 font-mono text-xs mt-0.5 break-all">&rarr; ${m.Destination}</div>
-            </div>
-        `}).join('') || '<div class="text-slate-500">No mounts found</div>';
+        const exitEl = document.getElementById('drawerExitCode');
+        if (exitEl) exitEl.textContent = state.ExitCode ?? '—';
 
-        let netHtml = Object.keys(net).map(k => `
-            <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-1">
-                <span class="text-slate-200 font-bold">${escapeHtml(k)}</span>
-                <div class="flex items-center gap-3 font-mono text-xs">
-                    <span class="text-cyan-400">IP: ${net[k].IPAddress || 'No IP'}</span>
-                    <span class="text-slate-500">Gateway: ${net[k].Gateway || 'None'}</span>
-                </div>
-            </div>
-        `).join('') || '<div class="text-slate-500">No networks attached</div>';
+        const restartEl = document.getElementById('drawerRestarts');
+        if (restartEl) restartEl.textContent = data.RestartCount ?? 0;
 
-        document.getElementById('modalContent').innerHTML = `
-            <div class="space-y-4">
-            <p class="text-xs text-slate-300">Restarts: ${data.RestartCount || 0} · Exit code: ${state.ExitCode ?? '—'} · OOM killed: ${state.OOMKilled ? 'Yes' : 'No'} · Health: ${data.Health?.Status || 'No healthcheck'}</p>
-                <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">Status</div>
-                        <div class="font-bold text-white capitalize">${state.Status || '-'}</div>
-                    </div>
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">Restarts</div>
-                        <div class="font-bold text-white font-mono">${data.RestartCount || 0}</div>
-                    </div>
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">Memory Limit</div>
-                        <div class="font-bold text-white font-mono">${data.Resources && data.Resources.Memory ? formatBytesNoDec(data.Resources.Memory) : 'Unlimited'}</div>
-                    </div>
-                    <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800">
-                        <div class="text-slate-400 mb-0.5">CPU Quota</div>
-                        <div class="font-bold text-white font-mono">${data.Resources && data.Resources.NanoCpus ? (data.Resources.NanoCpus / 1e9) + ' CPUs' : 'Unlimited'}</div>
-                    </div>
-                </div>
+        const oomEl = document.getElementById('drawerOomKilled');
+        if (oomEl) oomEl.textContent = state.OOMKilled ? 'Yes' : 'No';
 
-                <div>
-                    <h4 class="text-slate-300 font-bold mb-2 flex items-center gap-1.5"><i class="fa-solid fa-folder-tree text-indigo-400"></i> Mounts &amp; Volumes</h4>
-                    <div class="space-y-2">${mountsHtml}</div>
+        const netEl = document.getElementById('drawerNetworks');
+        if (netEl) {
+            const netKeys = Object.keys(net);
+            netEl.innerHTML = netKeys.length ? netKeys.map(k => `
+                <div class="flex items-center justify-between p-1.5 bg-slate-900 rounded border border-slate-800 text-[11px]">
+                    <span class="text-slate-300 font-semibold">${escapeHtml(k)}</span>
+                    <span class="text-cyan-400">IP: ${net[k].IPAddress || 'None'}</span>
                 </div>
+            `).join('') : '<p class="text-[11px] text-slate-500">No networks attached</p>';
+        }
 
-                <div>
-                    <h4 class="text-slate-300 font-bold mb-2 flex items-center gap-1.5"><i class="fa-solid fa-network-wired text-cyan-400"></i> Networks</h4>
-                    <div class="space-y-2">${netHtml}</div>
+        const mountsEl = document.getElementById('drawerMounts');
+        if (mountsEl) {
+            mountsEl.innerHTML = mounts.length ? mounts.map(m => `
+                <div class="p-2 bg-slate-950 rounded border border-slate-800 text-xs font-mono">
+                    <div class="flex items-center justify-between text-[10px] text-slate-400 mb-0.5">
+                        <span class="uppercase font-bold text-indigo-400">${escapeHtml(m.Type || 'mount')}</span>
+                        <span>${m.RW ? 'Read-Write' : 'Read-Only'}</span>
+                    </div>
+                    <div class="text-slate-300 truncate" title="${escapeHtml(m.Source)}">${escapeHtml(m.Source)}</div>
+                    <div class="text-cyan-400 truncate" title="${escapeHtml(m.Destination)}">&rarr; ${escapeHtml(m.Destination)}</div>
                 </div>
-
-                <div class="p-3 bg-slate-950/80 rounded-xl border border-slate-800/80 text-[11px] text-slate-400 flex items-center gap-2">
-                    <i class="fa-solid fa-shield-halved text-emerald-400"></i>
-                    <span>Environment variables (secrets) are stripped server-side to prevent credential or token leakage.</span>
-                </div>
-            </div>
-        `;
+            `).join('') : '<p class="text-[11px] text-slate-500">No mounts found</p>';
+        }
     } catch (err) {
         if (generation !== modalGeneration) return;
-        document.getElementById('modalContent').innerHTML = `
-            <div class="p-6 text-center text-rose-400">
-                <i class="fa-solid fa-triangle-exclamation text-2xl mb-2"></i>
-                <p>${escapeHtml(err.message)}</p>
-            </div>
-        `;
+        const exitEl = document.getElementById('drawerExitCode');
+        if (exitEl) exitEl.textContent = '—';
+        const restartEl = document.getElementById('drawerRestarts');
+        if (restartEl) restartEl.textContent = '—';
     }
 }
 
@@ -1157,7 +1702,7 @@ function renderLogs() {
     if (follow) pre.scrollTop = pre.scrollHeight;
 }
 async function refreshLogs() {
-    if (!logState) return;
+    if (!logState || document.hidden) return;
     clearTimeout(logTimer);
     if (logAbort) logAbort.abort();
     logAbort = new AbortController();
@@ -1175,7 +1720,7 @@ async function refreshLogs() {
     } catch (error) {
         if (error.name !== 'AbortError' && logState === state && generation === logGeneration) document.getElementById('logStatus').textContent = 'Logs unavailable';
     } finally {
-        if (logState === state && generation === logGeneration && !state.paused) logTimer = setTimeout(refreshLogs, 3000);
+        if (logState === state && generation === logGeneration && !state.paused && !document.hidden) logTimer = setTimeout(refreshLogs, 3000);
     }
 }
 function stopLogs() {
@@ -1212,6 +1757,8 @@ function closeModal() {
     modalGeneration++;
     modalPreviousFocus?.focus();
     document.getElementById('modalOverlay').classList.add('hidden');
+    document.getElementById('modalContent').innerHTML = '';
+    checkAutoResort();
 }
 
 window.addEventListener('keydown', (e) => {
@@ -1225,67 +1772,106 @@ function portUrl(port) {
     return url.href;
 }
 function renderIssues(data) {
-    const rows = Object.values(data.stacks || {}).flatMap(stack => stack.containers);
-    const issues = rows.filter(c => ['unhealthy','exited','dead','restarting'].includes(c.health));
-    document.getElementById('issuesSummary').textContent = issues.length ? `${issues.length} containers need attention · ${issues.slice(0, 5).map(c => c.name + ': ' + c.health).join(' · ') + (issues.length > 5 ? ' · …' : '')}` : 'All containers running or healthy';
-    document.getElementById('qf-issues').textContent = `Needs attention (${issues.length})`;
-}
-let historyFetched = 0;
-async function refreshHistory(force = false) {
-    if (!force && Date.now() - historyFetched < 15000) return;
-    historyFetched = Date.now();
-    try {
-        const res = await fetch('/api/history');
-        if (!res.ok) throw new Error('History unavailable');
-        const {points} = await res.json();
-        drawSparkline('cpuHistory', points, 'host_cpu', '#fbbf24');
-        drawSparkline('memoryHistory', points, 'host_memory', '#c084fc');
-        document.getElementById('historyStatus').textContent = `${points.length} samples · up to 60 minutes · kept in memory`;
-    } catch { document.getElementById('historyStatus').textContent = 'History unavailable'; }
-}
-function drawSparkline(id, points, metric, color) {
-    const svg = document.getElementById(id);
-    svg.replaceChildren();
-    const valid = points.filter(p => Number.isFinite(p[metric]));
-    if (!valid.length) return;
-    const end = points[points.length - 1].timestamp;
-    const start = Math.min(points[0].timestamp, end - 1);
-    let segment = [];
-    function flush() {
-        if (!segment.length) return;
-        const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
-        poly.setAttribute('points', segment.join(' '));
-        poly.setAttribute('fill','none'); poly.setAttribute('stroke', color); poly.setAttribute('stroke-width','2');
-        svg.append(poly); segment = [];
+    const rows = Object.values(data.stacks || {}).flatMap(stack => stack.containers || []);
+    const issuesCount = rows.filter(needsAttention).length;
+    const runningCount = rows.filter(isRunning).length;
+    const stoppedCount = rows.filter(isStopped).length;
+    const allCount = rows.length;
+
+    const summary = document.getElementById('issuesSummary');
+    summary.textContent = issuesCount ? `${issuesCount} ${issuesCount === 1 ? 'needs' : 'need'} attention` : 'No active issues';
+    summary.classList.toggle('attention', issuesCount > 0);
+    summary.dataset.value = issuesCount ? 'issues' : 'all';
+
+    const countAllEl = document.getElementById('count-all');
+    if (countAllEl) countAllEl.textContent = allCount;
+
+    // Hide stopped segments whose count is 0
+    const stoppedBtn = document.getElementById('qf-stopped');
+    if (stoppedBtn) {
+        if (stoppedCount === 0) {
+            stoppedBtn.hidden = true;
+            if (activeQuickFilter === 'stopped') setQuickFilter('all');
+        } else {
+            stoppedBtn.hidden = false;
+            stoppedBtn.textContent = `Stopped (${stoppedCount})`;
+        }
     }
-    let previous = null;
-    for (const point of points) {
-        if (!Number.isFinite(point[metric]) || (previous && point.timestamp - previous.timestamp > 30)) flush();
-        if (Number.isFinite(point[metric])) segment.push(`${(point.timestamp-start)/(end-start)*400},${58-Math.max(0,Math.min(100,point[metric]))/100*54}`);
-        previous = point;
+
+    // Hide issues segments whose count is 0
+    const issuesBtn = document.getElementById('qf-issues');
+    if (issuesBtn) {
+        if (issuesCount === 0) {
+            issuesBtn.hidden = true;
+            if (activeQuickFilter === 'issues') setQuickFilter('all');
+        } else {
+            issuesBtn.hidden = false;
+            issuesBtn.textContent = `Needs attention (${issuesCount})`;
+        }
     }
-    flush();
+
+    // Show Running only when it differs from All
+    const runningBtn = document.getElementById('qf-running');
+    if (runningBtn) {
+        if (runningCount === allCount || runningCount === 0) {
+            runningBtn.hidden = true;
+            if (activeQuickFilter === 'running') setQuickFilter('all');
+        } else {
+            runningBtn.hidden = false;
+            runningBtn.textContent = `Running (${runningCount})`;
+        }
+    }
 }
+function relativeTime(timestamp) {
+    return timestamp ? `${Math.max(0, Math.floor(Date.now() / 1000 - timestamp))}s ago` : 'No sample yet';
+}
+function updateSystemIndicator(data, failed = false) {
+    const age = data?.timestamp ? Math.max(0, Math.floor(Date.now()/1000 - data.timestamp)) : null;
+    const stale = !data || data.stale || age === null || age > (data.stale_after || 30);
+    const error = failed || Boolean(data?.last_error);
+    document.getElementById('statusText').textContent = error ? 'Poll failed' : stale ? `Stale · ${age ?? '—'}s ago` : `Live · ${age}s`;
+    document.getElementById('liveDot').className = `state-dot ${error ? 'critical' : stale ? 'warning' : ''}`;
+    const warning = document.getElementById('dataWarning');
+    warning.textContent = error ? 'Polling failed · Check system status' : 'Data is stale · Check system status';
+    warning.classList.toggle('hidden', !error && !stale);
+}
+const historyChart = new HostHistoryChart(document.getElementById('hostHistory'), document.getElementById('historyTooltip'), document.getElementById('historyStatus'));
+document.querySelectorAll('[data-range]').forEach(button => button.addEventListener('click', () => historyChart.setRange(Number(button.dataset.range))));
 async function showDiagnostics() {
-    openModal('Diagnostics', 'Docker connectivity and last successful measurements', '<pre id="diagnosticsText" class="text-xs whitespace-pre-wrap">Loading…</pre>', 'fa-stethoscope text-indigo-400', showDiagnostics);
-    const target = document.getElementById('diagnosticsText');
+    openModal('System status', 'Docker connectivity, measurement availability and polling cost', '<div id="diagnosticsPanel">Loading…</div>', 'fa-circle-info', showDiagnostics);
+    const generation = modalGeneration;
     try {
         const res = await fetch('/api/diagnostics');
         if (!res.ok) throw new Error();
-        target.textContent = JSON.stringify(await res.json(), null, 2);
-    } catch { target.textContent = 'Diagnostics unavailable'; }
+        const data = await res.json();
+        if (generation !== modalGeneration) return;
+        const row = (title, ok, detail) => `<div class="diagnostic-row"><span class="${ok ? 'check-ok' : 'check-fail'}">${ok ? '✓' : '✗'}</span><div><strong>${escapeHtml(title)}</strong><p class="muted">${escapeHtml(detail)}</p></div></div>`;
+        let content = row('Docker connection', data.docker.ok, `${data.backend || 'No backend'} · Socket ${data.socket_exists ? data.socket_accessible ? 'accessible' : 'not accessible' : 'missing'}. ${data.docker.reason} ${data.docker.hint}`);
+        content += row('Data freshness', data.freshness.ok, `Docker ${relativeTime(data.last_success)} · Host ${relativeTime(data.host_last_sample)} · Polling every ${data.poll_interval}s. ${data.freshness.reason} ${data.freshness.hint}`);
+        for (const [key, measurement] of Object.entries(data.measurements)) content += row(key, measurement.ok, `${measurement.reason} ${measurement.hint}`);
+        content += `<div class="diagnostic-facts"><div>Poll duration <span>${data.poll_timing.last_ms?.toFixed(1) ?? '—'} ms last / ${data.poll_timing.average_ms?.toFixed(1) ?? '—'} ms average</span></div><div>Dockpit cost <span>${data.process.cpu_pct?.toFixed(2) ?? '—'}% CPU · ${data.process.ram_bytes == null ? 'Unavailable' : formatBytesNoDec(data.process.ram_bytes)} RAM</span></div><div>Containers <span>${data.hidden_containers} hidden / ${data.total_containers} total</span></div><div>History buffer <span>${data.history.size} / ${data.history.capacity} samples</span></div></div>`;
+        if (data.last_error) content += row('Last error', false, `${data.last_error} ${data.last_error_hint}`);
+        content += '<details class="raw-details"><summary>Raw</summary><button data-action="copy-diagnostics">Copy</button><pre id="diagnosticsText"></pre></details>';
+        document.getElementById('diagnosticsPanel').innerHTML = content;
+        document.getElementById('diagnosticsText').textContent = JSON.stringify(data, null, 2);
+    } catch {
+        if (generation === modalGeneration) document.getElementById('diagnosticsPanel').textContent = 'System status unavailable. Check the Dockpit backend connection and reload.';
+    }
 }
 document.addEventListener('click', event => {
     const button = event.target.closest('[data-action]');
-    if (!button) return;
+    if (!button || event.target.closest('a')) return;
     const value = button.dataset.value;
     const actions = {
         close: closeModal, refresh: () => fetchStats(true), auto: toggleAutoRefresh,
-        expand: () => toggleExpandAll(value === 'true'), stack: () => toggleStack(value),
+        expand: () => toggleExpandAll(!Object.keys(dashboardData()?.stacks || {}).every(key => expandedStacks.has(key))), stack: () => toggleStack(value),
         card: () => openTopCardModal(value), filter: () => setQuickFilter(value),
         inspect: () => inspectContainer(value), logs: () => viewLogs(value),
         copy: () => copyText(value, button), 'copy-logs': () => copyText(document.getElementById('logText')?.textContent, button),
-        diagnostics: showDiagnostics, 'log-download': downloadLogs,
+        organize: () => organizeStacks(value), 'stack-assign': () => assignStack(), 'stack-reset': () => assignStack(true),
+        'stack-select': () => { document.querySelectorAll('.stack-choice:not([hidden]) input').forEach(input => { input.checked = true; }); updateStackSelection(); },
+        'stack-clear': () => { document.querySelectorAll('#stackChoices input').forEach(input => { input.checked = false; }); updateStackSelection(); },
+        diagnostics: showDiagnostics, 'copy-diagnostics': () => copyText(document.getElementById('diagnosticsText')?.textContent, button), 'log-download': downloadLogs,
         'log-pause': () => {
             if (!logState) return;
             logState.paused = !logState.paused;
@@ -1297,9 +1883,31 @@ document.addEventListener('click', event => {
 });
 document.getElementById('searchInput').value = typeof preferences.search === 'string' ? preferences.search : '';
 if (['cpu','mem','containers','name'].includes(preferences.sort)) document.getElementById('sortBy').value = preferences.sort;
-document.getElementById('searchInput').addEventListener('input', renderDashboard);
-document.getElementById('sortBy').addEventListener('change', renderDashboard);
-setQuickFilter(['all','cpu','mem','ports','secondary','root','issues'].includes(activeQuickFilter) ? activeQuickFilter : 'all');
+document.getElementById('searchInput').addEventListener('input', () => renderDashboard(true));
+document.getElementById('sortBy').addEventListener('change', () => renderDashboard(true));
+
+const pausedPill = document.getElementById('orderPausedPill');
+if (pausedPill) {
+    pausedPill.addEventListener('click', () => {
+        renderDashboard(true);
+    });
+}
+
+const stacksCont = document.getElementById('stacksContainer');
+if (stacksCont) {
+    stacksCont.addEventListener('pointerenter', () => { isPointerOverList = true; });
+    stacksCont.addEventListener('pointerleave', () => { isPointerOverList = false; checkAutoResort(); });
+    stacksCont.addEventListener('pointerover', (e) => {
+        if (e.target.closest('.stack-row, .container-row')) isPointerOverList = true;
+    });
+    stacksCont.addEventListener('pointerout', (e) => {
+        if (!e.relatedTarget || !stacksCont.contains(e.relatedTarget)) {
+            isPointerOverList = false;
+            checkAutoResort();
+        }
+    });
+}
+setQuickFilter(activeQuickFilter);
 fetchStats();
 startInterval();
 
@@ -1312,4 +1920,20 @@ document.addEventListener('keydown', event => {
     const first = focusable[0], last = focusable[focusable.length - 1];
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+});
+
+document.addEventListener('click', event => { const filters = document.querySelector('.filters'); if (!filters.contains(event.target) || event.target.closest('.qf-btn')) filters.open = false; });
+
+historyChart.start();
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearInterval(refreshInterval);
+        statsAbort?.abort();
+        historyChart.stop();
+        clearTimeout(logTimer);
+        logAbort?.abort();
+    } else {
+        if (autoRefresh) { fetchStats(); startInterval(); historyChart.start(); }
+        if (logState && !logState.paused) refreshLogs();
+    }
 });

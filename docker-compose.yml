@@ -11,6 +11,8 @@ services:
       # DOCKPIT_SECONDARY_STORAGE_PATH: /host/root/mnt/data
       # DOCKPIT_SECONDARY_STORAGE_LABEL: Data Storage
     volumes:
+      # Frontend edits are served on refresh; rebuild CSS after editing input.css.
+      - ./dockpit/static:/app/dockpit/static:ro
       # :ro does not restrict Docker API operations. See SECURITY.md.
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /proc:/host/proc:ro

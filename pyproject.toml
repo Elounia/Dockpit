@@ -37,4 +37,4 @@ dockpit = "dockpit.app:main"
 packages = ["dockpit"]
 
 [tool.setuptools.package-data]
-dockpit = ["static/*.html", "static/*.js", "static/*.css", "static/vendor/fontawesome/css/*.css", "static/vendor/fontawesome/webfonts/*.woff2", "static/vendor/*/LICENSE.txt"]
+dockpit = ["static/*.html", "static/*.js", "static/*.css", "static/*.svg", "static/*.ico", "static/*.png", "static/vendor/fontawesome/css/*.css", "static/vendor/fontawesome/webfonts/*.woff2", "static/vendor/*/LICENSE.txt"]

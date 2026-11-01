@@ -11,16 +11,27 @@ No third-party Python runtime dependencies. Browser assets are included and work
 
 ## Preview
 
-![Illustrative dashboard preview](assets/screenshot.svg)
+![Dockpit dashboard with host metrics and Compose stacks](assets/screenshot-overview.png)
 
-The preview uses sample data. See the running dashboard for current features.
+Real browser screenshots of Dockpit running with sample data, captured in Chromium.
+
+<details>
+<summary>View expanded stacks and container metrics</summary>
+
+![Dockpit with expanded stacks and per-container CPU and memory usage](assets/screenshot-stacks.png)
+
+</details>
+
+To capture fresh screenshots, install Playwright and Chromium (`python3 -m pip install playwright` and `python3 -m playwright install chromium`), then run `python3 scripts/capture-screenshots.py`. The capture uses synthetic data and does not connect to Docker.
 
 ## Features
 
-- Containers grouped by Compose project, including stopped containers.
+- Containers grouped by Compose project or Swarm stack, including stopped containers. Unassigned containers sharing an image repository are grouped automatically; CubeCoders AMP instances appear under AMP.
+- Organize stacks with searchable bulk selection, existing or new stack names, and a reset to automatic grouping. Choices persist in this browser; container names keep assignments stable across recreation.
 - Host CPU, RAM and storage metrics; Docker CPU totals normalized to host capacity.
+- GPU card beside CPU with device details, utilization and VRAM where supported; NVIDIA GPU/VRAM per container. See [GPU setup and driver support](docs/DOCKER.md#gpu-monitoring).
 - Cache-adjusted container memory (`Used Memory = max(0, usage - inactive_file)`), per-container limits and network I/O totals.
-- Health overview and a Needs attention filter for unhealthy, exited, dead and restarting containers.
+- Status filters for running, stopped, paused, starting/created, and containers with published ports. Needs attention highlights unhealthy, dead and restarting containers; stopped containers are a neutral category. Sort by CPU or RAM to find resource-heavy workloads.
 - CPU/RAM sparklines with up to one hour of in-memory history. History resets on restart.
 - Search, sorting and persistent filters/expanded stacks in browser local storage.
 - Log snapshots refreshed every three seconds, with pause, search, timestamps, copy and download.
@@ -109,12 +120,15 @@ services:
   app:
     labels:
       dockpit.name: My application
+      dockpit.stack: My stack
       dockpit.icon: fa-globe
       dockpit.url: https://app.example.com
       # dockpit.hide: "true"
 ```
 
 `dockpit.url` accepts HTTP(S) URLs only. `dockpit.icon` is a Font Awesome solid icon class. Hidden containers are excluded from Dockpit's inventory, totals and inspection/log allowlist; this is display configuration, not an authorization mechanism. Host metrics still cover the entire host. CLI fallback has less metadata than the socket backend.
+
+Stack grouping uses `dockpit.stack` first, then Compose project, then Swarm namespace. Containers without these labels are grouped by the full image repository (ignoring version tags and digests); unrelated repositories and explicit projects stay separate. Remaining containers appear in Standalone. Browser assignments override this display locally. To share an organization across browsers, set `dockpit.stack` on the containers. Organizing stacks changes the dashboard display; Docker resources are read-only.
 
 ## Development and validation
 
