@@ -84,7 +84,7 @@ function getStackIcon(name) {
 
 let statsPending = false;
 async function fetchStats(force = false) {
-    if (statsPending) return;
+    if (statsPending || document.hidden || (!autoRefresh && !force)) return;
     statsPending = true;
     try {
         const res = await fetch('/api/stats');
@@ -95,19 +95,12 @@ async function fetchStats(force = false) {
         updateTopKPIs(data);
         renderDashboard();
 
-        const sampled = new Date(data.timestamp * 1000);
-        document.getElementById('statusText').textContent = (data.stale ? 'Stale · last sample ' : 'Sampled ') + sampled.toLocaleTimeString();
-        const warning = document.getElementById('dataWarning');
-        warning.textContent = data.stale ? 'Docker measurements are stale. Open Diagnostics to check access and polling.' : '';
-        warning.classList.toggle('hidden', !data.stale);
+        updateSystemIndicator(data);
         renderIssues(data);
         refreshHistory();
     } catch (err) {
         console.error('Error fetching stats:', err);
-        document.getElementById('statusText').textContent = 'Connection error';
-        const warning = document.getElementById('dataWarning');
-        warning.textContent = 'Measurements could not be refreshed. Displayed values may be outdated.';
-        warning.classList.remove('hidden');
+        updateSystemIndicator(latestData, true);
     } finally { statsPending = false; }
 }
 
@@ -180,13 +173,8 @@ function toggleExpandAll(expand) {
 
 function setQuickFilter(type) {
     activeQuickFilter = type;
-    document.querySelectorAll('.qf-btn').forEach(btn => {
-        btn.className = 'qf-btn text-xs px-3 py-1 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700/60 transition cursor-pointer';
-    });
-    const activeBtn = document.getElementById('qf-' + type);
-    if (activeBtn) {
-        activeBtn.className = 'qf-btn text-xs px-3 py-1 rounded-lg bg-indigo-600 text-white font-medium transition cursor-pointer';
-    }
+    document.querySelectorAll('.qf-btn').forEach(btn => btn.setAttribute('aria-pressed', btn.dataset.value === type));
+    document.querySelector('.filters summary').textContent = ['all', 'issues'].includes(type) ? 'Filters' : 'Filters · 1';
     renderDashboard();
 }
 
@@ -210,7 +198,7 @@ function startInterval() {
     clearInterval(refreshInterval);
     refreshInterval = setInterval(() => {
         if (autoRefresh) fetchStats();
-    }, 2500);
+    }, (latestData?.poll_interval || 2) * 1000);
 }
 
 // ==========================================
@@ -728,7 +716,7 @@ function renderSystemDetailsModal(sys, docker) {
 }
 
 function renderDashboard() {
-    const view = escapedView(latestData);
+    const view = latestData;
     if (!latestData || !view.stacks) return;
 
     savePreferences();
@@ -795,196 +783,44 @@ function renderDashboard() {
     let html = '';
     for (const stack of filtered) {
         const isExpanded = (q && q.length > 0) || expandedStacks.has(stack.key);
-        const sIcon = getStackIcon(stack.name);
-        const totalMem = stack.total_mem_formatted || formatBytesNoDec(stack.total_mem_bytes);
-
-        html += `
-        <div class="glass-card rounded-2xl overflow-hidden border border-slate-800 transition">
-            <!-- Stack Header / Accordion trigger -->
-            <div role="button" tabindex="0" data-action="stack" data-value="${escapeHtml(stack.key)}"
-                 class="p-3.5 bg-slate-900/80 hover:bg-slate-850/90 cursor-pointer flex flex-col md:flex-row md:items-center justify-between gap-3 select-none">
-                <div class="flex items-center gap-3">
-                    <div class="w-8 h-8 rounded-xl ${sIcon.bg} ${sIcon.border} border flex items-center justify-center ${sIcon.color}">
-                        <i class="fa-solid ${sIcon.icon} text-sm"></i>
-                    </div>
-                    <div>
-                        <div class="flex items-center gap-2">
-                            <h2 class="text-base font-bold text-white tracking-tight">${stack.name}</h2>
-                            <span class="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-0.5 rounded-full border border-slate-700/60">
-                                ${stack.displayContainers.length}${stack.displayContainers.length !== stack.total_containers ? ` of ${stack.total_containers}` : ''} containers
-                            </span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="flex items-center gap-4 text-xs font-mono">
-                    <div class="flex items-center gap-1.5 text-slate-300">
-                        <i class="fa-solid fa-microchip text-amber-400 text-[11px]"></i>
-                        <span>${stack.total_cpu.toFixed(1)}% CPU</span>
-                    </div>
-                    <div class="flex items-center gap-1.5 text-slate-300">
-                        <i class="fa-solid fa-memory text-purple-400 text-[11px]"></i>
-                        <span>${totalMem} RAM</span>
-                        <span class="text-slate-500 text-[10px]">(${stack.docker_mem_share || 0}% Docker)</span>
-                    </div>
-                    <div class="text-slate-400 pl-2">
-                        <i class="fa-solid fa-chevron-${isExpanded ? 'up' : 'down'} text-xs text-slate-500"></i>
-                    </div>
-                </div>
+        const state = stack.containers.some(c => needsAttention(c)) ? 'warning' : stack.containers.every(c => ['healthy','running'].includes(c.health)) ? '' : 'warning';
+        html += `<section class="stack-group">
+            <div role="button" tabindex="0" aria-expanded="${Boolean(isExpanded)}" data-action="stack" data-value="${escapeHtml(stack.key)}" class="stack-row">
+                <div class="stack-name"><span class="state-dot ${state}"></span><h2>${escapeHtml(stack.name)}</h2><small>${stack.displayContainers.length} containers</small></div>
+                ${rowMetric(`${stack.total_cpu.toFixed(1)}%`, stack.total_cpu / (latestData.system?.cpus || 1))}
+                ${rowMetric(formatBytesNoDec(stack.total_mem_bytes), stack.host_mem_perc)}
+                <span class="muted" aria-hidden="true">${isExpanded ? '−' : '+'}</span>
             </div>
-
-            <!-- Containers List -->
-            ${isExpanded ? `
-            <div class="divide-y divide-slate-800/80 border-t border-slate-800/80">
-                ${stack.displayContainers.map(c => renderContainerRow(c, stack)).join('')}
-            </div>
-            ` : ''}
-        </div>
-        `;
+            ${isExpanded ? `<div>${stack.displayContainers.map(c => renderContainerRow(c, stack)).join('')}</div>` : ''}
+        </section>`;
     }
+    const allExpanded = Object.keys(view.stacks).every(key => expandedStacks.has(key));
+    const expand = document.getElementById('expandAll');
+    expand.setAttribute('aria-label', allExpanded ? 'Collapse all stacks' : 'Expand all stacks');
+    expand.title = expand.getAttribute('aria-label');
+    expand.textContent = allExpanded ? '−' : '↕';
 
     containerEl.innerHTML = html;
 }
 
-function renderContainerRow(c, stack) {
-    const h = getHealthBadge(c.health);
-
-    // Format ports nicely with links
-    let portsHtml = '';
-    if (c.ports) {
-        const portItems = c.ports.split(',').map(p => p.trim()).filter(Boolean);
-        portsHtml = portItems.map(p => {
-            const match = p.match(/(?:^|:)(\d+)-(?:>|&gt;)/);
-            if (match) {
-                const portNum = match[1];
-                return `<a href="${escapeHtml(portUrl(portNum))}" target="_blank" rel="noopener noreferrer" title="Open port in browser" class="text-cyan-400 hover:text-cyan-300 hover:underline bg-cyan-950/60 border border-cyan-800/40 px-1.5 py-0.5 rounded text-[11px] font-mono flex items-center gap-1"><i class="fa-solid fa-arrow-up-right-from-square text-[9px]"></i>${portNum}</a>`;
-            }
-            return `<span class="text-slate-400 bg-slate-800/70 border border-slate-700/50 px-1.5 py-0.5 rounded text-[11px] font-mono">${p}</span>`;
-        }).join('');
-    }
-
-    // CPU Meter calculations
-    const cpuBarWidth = Math.min(100, Math.max(2, (c.cpu_perc / 100) * 100));
-    const cpuColor = c.cpu_perc > 50 ? 'bg-rose-500' : (c.cpu_perc > 10 ? 'bg-amber-400' : 'bg-amber-400/80');
-
-    // RAM Meter calculations
-    let memBarWidth = 2;
-    let memBarLabel = c.mem_used_formatted || '0 B';
-    let memSubLabel = '';
-    let memColor = 'bg-purple-500';
-
-    if (c.has_custom_limit) {
-        memBarWidth = Math.min(100, Math.max(2, c.mem_perc || 0));
-        memSubLabel = `${Math.round(c.mem_perc)}% of ${c.mem_limit_formatted}`;
-        if (c.mem_perc > 85) memColor = 'bg-rose-500';
-    } else {
-        const shareOfStack = stack.total_mem_bytes > 0 ? Math.round((c.mem_used_bytes / stack.total_mem_bytes) * 100) : 0;
-        memBarWidth = Math.min(100, Math.max(2, shareOfStack));
-        memSubLabel = `${shareOfStack}% of stack`;
-    }
-
-    return `
-    <div class="p-3.5 hover:bg-slate-900/50 transition flex flex-col xl:flex-row xl:items-center justify-between gap-3">
-        <!-- Info Column -->
-        <div class="flex-1 min-w-0 space-y-1">
-            <div class="flex items-center gap-2 flex-wrap">
-                <span class="w-2.5 h-2.5 rounded-full ${h.color === 'text-emerald-400' ? 'bg-emerald-400' : (h.color === 'text-blue-400' ? 'bg-blue-400' : (h.color === 'text-rose-400' ? 'bg-rose-400' : 'bg-slate-500'))} inline-block shrink-0 shadow-sm" title="${h.label}"></span>
-                <h3 class="text-sm font-bold text-white truncate max-w-md hover:text-indigo-400 transition cursor-pointer" data-action="inspect" data-value="${c.name}">
-                    <i class="fa-solid ${c.icon || 'fa-cube'} text-slate-400"></i> ${c.display_name || c.name}
-                </h3>
-                <span class="text-[10px] font-mono text-slate-400 bg-slate-800/80 border border-slate-700/60 px-1.5 py-0.5 rounded">
-                    ${c.id}
-                </span>
-                <span class="text-[11px] font-medium px-2 py-0.5 rounded-full ${h.bg} ${h.color} ${h.border} border flex items-center gap-1">
-                    <i class="fa-solid ${h.icon} text-[10px]"></i> ${h.label}
-                </span>
-                ${c.service && c.service !== c.name ? `
-                <span class="text-[10px] text-slate-400 bg-slate-900 border border-slate-800 px-2 py-0.5 rounded font-mono">
-                    svc: ${c.service}
-                </span>
-                ` : ''}
-            </div>
-
-            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
-                <span class="truncate max-w-sm text-slate-400" title="${c.image}">
-                    <i class="fa-solid fa-box text-slate-500 mr-1"></i> ${c.image}
-                </span>
-                <span><i class="fa-regular fa-clock text-slate-500 mr-1"></i> ${c.created}</span>
-                ${portsHtml ? `<div class="flex flex-wrap items-center gap-1.5">${portsHtml}</div>` : ''}
-            </div>
-        </div>
-
-        <!-- Metrics Grid -->
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-2.5 w-full xl:w-auto xl:min-w-[580px] shrink-0">
-            <!-- CPU Meter -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="flex items-center justify-between text-xs mb-1">
-                    <span class="text-slate-400 text-[11px] flex items-center gap-1 font-medium shrink-0"><i class="fa-solid fa-microchip text-[10px] text-amber-400"></i> CPU</span>
-                    <span class="text-slate-200 font-bold metric-badge font-mono truncate ml-1">${c.cpu_perc.toFixed(1)}%</span>
-                </div>
-                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                    <div class="${cpuColor} h-1.5 rounded-full progress-bar-smooth" style="width: ${cpuBarWidth}%"></div>
-                </div>
-                <div class="text-[10px] text-slate-400 mt-1 font-mono">PIDs: ${c.pids}</div>
-            </div>
-
-            <!-- RAM Meter -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="flex items-center justify-between text-xs mb-1">
-                    <span class="text-slate-400 text-[11px] flex items-center gap-1 font-medium shrink-0"><i class="fa-solid fa-memory text-[10px] text-purple-400"></i> RAM</span>
-                    <span class="text-slate-200 font-bold metric-badge font-mono truncate ml-1">${memBarLabel}</span>
-                </div>
-                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                    <div class="${memColor} h-1.5 rounded-full progress-bar-smooth" style="width: ${memBarWidth}%"></div>
-                </div>
-                <div class="text-[10px] text-slate-400 mt-1 font-mono truncate" title="${memSubLabel}">${memSubLabel}</div>
-            </div>
-
-            <!-- Disk Block I/O -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="text-[11px] text-slate-400 flex items-center justify-between font-medium mb-1">
-                    <span class="flex items-center gap-1 shrink-0"><i class="fa-solid fa-hard-drive text-[10px] text-cyan-400"></i> I/O</span>
-                    <span class="text-[10px] font-mono text-slate-400 truncate ml-1">${c.storage_tier || 'Root'}</span>
-                </div>
-                <div class="text-[10px] font-mono space-y-0.5">
-                    <div class="flex justify-between text-slate-400">
-                        <span>Read:</span> <span class="text-slate-200 font-semibold truncate ml-1">${c.block_read}</span>
-                    </div>
-                    <div class="flex justify-between text-slate-400">
-                        <span>Write:</span> <span class="text-cyan-300 font-semibold truncate ml-1">${c.block_write}</span>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Net I/O -->
-            <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/70 flex flex-col justify-between">
-                <div class="text-[11px] text-slate-400 flex items-center gap-1 font-medium mb-1">
-                    <i class="fa-solid fa-arrow-right-arrow-left text-[10px] text-emerald-400"></i> Net
-                </div>
-                <div class="text-[10px] font-mono space-y-0.5">
-                    <div class="flex justify-between text-slate-400">
-                        <span>Down:</span> <span class="text-emerald-400 font-semibold truncate ml-1">${c.net_rx}</span>
-                    </div>
-                    <div class="flex justify-between text-slate-400">
-                        <span>Up:</span> <span class="text-indigo-300 font-semibold truncate ml-1">${c.net_tx}</span>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Action Buttons -->
-        ${c.url ? `<a href="${c.url}" target="_blank" rel="noopener noreferrer" class="text-xs text-cyan-300 hover:underline">Open app</a>` : ''}
-        ${c.state === 'running' && !c.stats_available ? '<span class="text-xs text-amber-300">Metrics unavailable</span>' : ''}
-        <div class="flex items-center gap-1.5 xl:flex-col xl:items-end shrink-0">
-            <button data-action="inspect" data-value="${c.name}" class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1 cursor-pointer">
-                <i class="fa-solid fa-circle-info text-indigo-400"></i> Details
-            </button>
-            <button data-action="logs" data-value="${c.name}" class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1 cursor-pointer">
-                <i class="fa-solid fa-terminal text-cyan-400"></i> Logs
-            </button>
-        </div>
-    </div>
-    `;
+function needsAttention(c) { return ['unhealthy','exited','dead','restarting'].includes(c.health); }
+function rowMetric(label, percent) {
+    const pct = Math.max(0, Math.min(100, percent || 0));
+    return `<div class="row-metric"><span>${escapeHtml(label)}</span><span class="thin-bar"><span class="${pct >= 90 ? 'critical' : pct >= 75 ? 'warning' : ''}" style="width:${pct}%"></span></span></div>`;
+}
+function renderContainerRow(container) {
+    const c = escapedView(container);
+    const ports = (container.ports || '').split(',').filter(Boolean).map(port => {
+        const match = port.match(/(?:^|:)(\d+)->/);
+        return match ? `<a href="${escapeHtml(portUrl(match[1]))}" target="_blank" rel="noopener noreferrer">${escapeHtml(port.trim())}</a>` : escapeHtml(port);
+    }).join(' · ');
+    return `<div class="container-row" role="button" tabindex="0" data-action="inspect" data-value="${c.name}">
+        <div class="container-main"><span class="stack-name"><span class="state-dot ${needsAttention(container) ? 'warning' : ''}"></span><strong>${c.display_name || c.name}</strong><span class="muted">${c.health}</span></span>
+        <span class="row-metric">${c.cpu_perc.toFixed(1)}% CPU · ${c.mem_used_formatted || '0 B'} RAM</span>
+        <button data-action="logs" data-value="${c.name}">Logs</button></div>
+        <div class="container-meta"><span>${c.image}</span>${ports ? `<span>${ports}</span>` : ''}<span>Network ↓ ${c.net_rx || '—'} ↑ ${c.net_tx || '—'}</span>
+        ${c.app_url ? `<a href="${c.app_url}" target="_blank" rel="noopener noreferrer">Open app</a>` : ''}</div>
+    </div>`;
 }
 
 async function inspectContainer(name) {
@@ -1114,7 +950,7 @@ function renderLogs() {
     if (follow) pre.scrollTop = pre.scrollHeight;
 }
 async function refreshLogs() {
-    if (!logState) return;
+    if (!logState || document.hidden) return;
     clearTimeout(logTimer);
     if (logAbort) logAbort.abort();
     logAbort = new AbortController();
@@ -1132,7 +968,7 @@ async function refreshLogs() {
     } catch (error) {
         if (error.name !== 'AbortError' && logState === state && generation === logGeneration) document.getElementById('logStatus').textContent = 'Logs unavailable';
     } finally {
-        if (logState === state && generation === logGeneration && !state.paused) logTimer = setTimeout(refreshLogs, 3000);
+        if (logState === state && generation === logGeneration && !state.paused && !document.hidden) logTimer = setTimeout(refreshLogs, 3000);
     }
 }
 function stopLogs() {
@@ -1183,9 +1019,25 @@ function portUrl(port) {
 }
 function renderIssues(data) {
     const rows = Object.values(data.stacks || {}).flatMap(stack => stack.containers);
-    const issues = rows.filter(c => ['unhealthy','exited','dead','restarting'].includes(c.health));
-    document.getElementById('issuesSummary').textContent = issues.length ? `${issues.length} containers need attention · ${issues.slice(0, 5).map(c => c.name + ': ' + c.health).join(' · ') + (issues.length > 5 ? ' · …' : '')}` : 'All containers running or healthy';
-    document.getElementById('qf-issues').textContent = `Needs attention (${issues.length})`;
+    const count = rows.filter(needsAttention).length;
+    const summary = document.getElementById('issuesSummary');
+    summary.textContent = count ? `${count} need attention` : 'All healthy';
+    summary.classList.toggle('attention', count > 0);
+    summary.dataset.value = count ? 'issues' : 'all';
+    document.getElementById('qf-issues').textContent = `Needs attention (${count})`;
+}
+function relativeTime(timestamp) {
+    return timestamp ? `${Math.max(0, Math.floor(Date.now() / 1000 - timestamp))}s ago` : 'No sample yet';
+}
+function updateSystemIndicator(data, failed = false) {
+    const age = data?.timestamp ? Math.max(0, Math.floor(Date.now()/1000 - data.timestamp)) : null;
+    const stale = !data || data.stale || age === null || age > (data.stale_after || 30);
+    const error = failed || Boolean(data?.last_error);
+    document.getElementById('statusText').textContent = error ? 'Poll failed' : stale ? `Stale · ${age ?? '—'}s ago` : `Live · ${age}s`;
+    document.getElementById('liveDot').className = `state-dot ${error ? 'critical' : stale ? 'warning' : ''}`;
+    const warning = document.getElementById('dataWarning');
+    warning.textContent = error ? 'Polling failed · Check system status' : 'Data is stale · Check system status';
+    warning.classList.toggle('hidden', !error && !stale);
 }
 let historyFetched = 0;
 async function refreshHistory(force = false) {
@@ -1224,25 +1076,37 @@ function drawSparkline(id, points, metric, color) {
     flush();
 }
 async function showDiagnostics() {
-    openModal('Diagnostics', 'Docker connectivity and last successful measurements', '<pre id="diagnosticsText" class="text-xs whitespace-pre-wrap">Loading…</pre>', 'fa-stethoscope text-indigo-400', showDiagnostics);
-    const target = document.getElementById('diagnosticsText');
+    openModal('System status', 'Docker connectivity, measurement availability and polling cost', '<div id="diagnosticsPanel">Loading…</div>', 'fa-circle-info', showDiagnostics);
+    const generation = modalGeneration;
     try {
         const res = await fetch('/api/diagnostics');
         if (!res.ok) throw new Error();
-        target.textContent = JSON.stringify(await res.json(), null, 2);
-    } catch { target.textContent = 'Diagnostics unavailable'; }
+        const data = await res.json();
+        if (generation !== modalGeneration) return;
+        const row = (title, ok, detail) => `<div class="diagnostic-row"><span class="${ok ? 'check-ok' : 'check-fail'}">${ok ? '✓' : '✗'}</span><div><strong>${escapeHtml(title)}</strong><p class="muted">${escapeHtml(detail)}</p></div></div>`;
+        let content = row('Docker connection', data.docker.ok, `${data.backend || 'No backend'} · Socket ${data.socket_exists ? data.socket_accessible ? 'accessible' : 'not accessible' : 'missing'}. ${data.docker.reason} ${data.docker.hint}`);
+        content += row('Data freshness', !data.stale, `Docker ${relativeTime(data.last_success)} · Host ${relativeTime(data.host_last_sample)} · Polling every ${data.poll_interval}s. ${data.stale ? 'Check Docker access and the configured poll interval.' : ''}`);
+        for (const [key, measurement] of Object.entries(data.measurements)) content += row(key, measurement.ok, `${measurement.reason} ${measurement.hint}`);
+        content += `<div class="diagnostic-facts"><div>Poll duration <span>${data.poll_timing.last_ms?.toFixed(1) ?? '—'} ms last / ${data.poll_timing.average_ms?.toFixed(1) ?? '—'} ms average</span></div><div>Dockpit cost <span>${data.process.cpu_pct?.toFixed(2) ?? '—'}% CPU · ${formatBytesNoDec(data.process.ram_bytes)} RAM</span></div><div>Containers <span>${data.hidden_containers} hidden / ${data.total_containers} total</span></div><div>History buffer <span>${data.history.size} / ${data.history.capacity} samples</span></div></div>`;
+        if (data.last_error) content += row('Last error', false, `${data.last_error} ${data.last_error_hint}`);
+        content += '<details class="raw-details"><summary>Raw</summary><button data-action="copy-diagnostics">Copy</button><pre id="diagnosticsText"></pre></details>';
+        document.getElementById('diagnosticsPanel').innerHTML = content;
+        document.getElementById('diagnosticsText').textContent = JSON.stringify(data, null, 2);
+    } catch {
+        if (generation === modalGeneration) document.getElementById('diagnosticsPanel').textContent = 'System status unavailable. Check the Dockpit backend connection and reload.';
+    }
 }
 document.addEventListener('click', event => {
     const button = event.target.closest('[data-action]');
-    if (!button) return;
+    if (!button || event.target.closest('a')) return;
     const value = button.dataset.value;
     const actions = {
         close: closeModal, refresh: () => fetchStats(true), auto: toggleAutoRefresh,
-        expand: () => toggleExpandAll(value === 'true'), stack: () => toggleStack(value),
+        expand: () => toggleExpandAll(!Object.keys(latestData?.stacks || {}).every(key => expandedStacks.has(key))), stack: () => toggleStack(value),
         card: () => openTopCardModal(value), filter: () => setQuickFilter(value),
         inspect: () => inspectContainer(value), logs: () => viewLogs(value),
         copy: () => copyText(value, button), 'copy-logs': () => copyText(document.getElementById('logText')?.textContent, button),
-        diagnostics: showDiagnostics, 'log-download': downloadLogs,
+        diagnostics: showDiagnostics, 'copy-diagnostics': () => copyText(document.getElementById('diagnosticsText')?.textContent, button), 'log-download': downloadLogs,
         'log-pause': () => {
             if (!logState) return;
             logState.paused = !logState.paused;
@@ -1270,3 +1134,5 @@ document.addEventListener('keydown', event => {
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
 });
+
+document.addEventListener('click', event => { const filters = document.querySelector('.filters'); if (!filters.contains(event.target) || event.target.closest('.qf-btn')) filters.open = false; });

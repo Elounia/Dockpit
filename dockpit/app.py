@@ -40,6 +40,8 @@ STALE_AFTER = max(30, POLL_INTERVAL * 3)
 history = deque(maxlen=7200)
 api_slots = threading.BoundedSemaphore(4)
 poll_status = {"last_attempt": None, "last_success": None, "last_error": None, "backend": None}
+poll_durations = deque(maxlen=60)
+_process_previous = (time.monotonic(), time.process_time())
 stop_event = threading.Event()
 
 PROC_DIR = os.environ.get(
@@ -718,6 +720,7 @@ def aggregate_snapshot(rows, system, backend):
 def _fetch_docker_metrics_socket():
     system = get_system_metrics()
     containers = docker_json("/containers/json?all=1")
+    total_inventory = len(containers)
     containers = [c for c in containers if (c.get("Labels") or {}).get("dockpit.hide", "").lower() != "true"]
     running_ids = {c["Id"] for c in containers if c.get("State") == "running"}
     with _cpu_cache_lock:
@@ -726,7 +729,9 @@ def _fetch_docker_metrics_socket():
                 del _container_cpu_cache[cid]
     with ThreadPoolExecutor(max_workers=16) as pool:
         rows = list(pool.map(lambda c: fetch_single_container_stats(c, system["mem_total_bytes"], system["cpus"]), containers))
-    return aggregate_snapshot(rows, system, "socket")
+    snapshot = aggregate_snapshot(rows, system, "socket")
+    snapshot.update(hidden_containers=total_inventory - len(rows), inventory_total=total_inventory)
+    return snapshot
 
 
 def _fetch_docker_metrics_subprocess():
@@ -760,7 +765,9 @@ def _fetch_docker_metrics_subprocess():
             "block_read": "Unavailable", "block_write": "Unavailable",
         })
         rows.append(row)
-    return aggregate_snapshot(rows, system, "cli")
+    snapshot = aggregate_snapshot(rows, system, "cli")
+    snapshot.update(hidden_containers=len(containers) - len(rows), inventory_total=len(containers))
+    return snapshot
 
 
 def fetch_docker_metrics():
@@ -776,6 +783,7 @@ def fetch_docker_metrics():
 def poll_once():
     global cached_data
     attempted = time.time()
+    started = time.monotonic()
     try:
         data = fetch_docker_metrics()
         if not data:
@@ -794,6 +802,55 @@ def poll_once():
         with cache_lock:
             poll_status.update(last_attempt=attempted, last_error=message)
         return False
+    finally:
+        elapsed = (time.monotonic() - started) * 1000
+        with cache_lock:
+            poll_durations.append(elapsed)
+            poll_status["poll_timing"] = {"last_ms": elapsed, "average_ms": sum(poll_durations) / len(poll_durations)}
+            poll_status["process"] = process_metrics()
+
+
+def process_metrics():
+    """Process CPU as one-core percent and resident memory, without another subprocess."""
+    global _process_previous
+    wall, cpu = time.monotonic(), time.process_time()
+    prev_wall, prev_cpu = _process_previous
+    _process_previous = (wall, cpu)
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        ram = pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        ram = None
+    return {"cpu_pct": max(0, (cpu - prev_cpu) / max(.001, wall - prev_wall) * 100), "ram_bytes": ram}
+
+
+def diagnostics_payload(data, status, stale, points):
+    system = data.get("system", {})
+    gpu = system.get("gpu", {})
+    devices = gpu.get("devices", [])
+    measurements = {}
+    for name, key, reason, hint in (
+        ("CPU", "host_cpu_pct", "CPU counters unavailable or warming up.", "Check DOCKPIT_PROC_DIR/stat is readable; wait for two samples."),
+        ("RAM", "mem_pct", "Host memory counters unavailable.", "Mount host /proc read-only and check DOCKPIT_PROC_DIR/meminfo."),
+        ("Storage", "root_pct", "Root filesystem usage unavailable.", "Check the host root mount and DOCKPIT_ROOT_DIR permissions."),
+    ):
+        ok = system.get(key) is not None
+        measurements[name] = {"ok": ok, "reason": "Measured." if ok else reason, "hint": "" if ok else hint}
+    gpu_ok = gpu.get("utilization_pct") is not None
+    gpu_reason = "Measured." if gpu_ok else ((", ".join(d.get("name", "GPU") for d in devices) + " detected, no usage metrics.") if devices else "No GPU detected.")
+    gpu_hint = "" if gpu_ok else ("/dev/dri is not mounted. Mount it to expose GPU device counters." if devices and not os.path.exists("/dev/dri") and any(d.get("vendor") in ("Intel", "AMD") for d in devices) else "Check GPU device mounts and driver metric support." if devices else "If a GPU is expected, check device mounts and driver visibility.")
+    measurements["GPU"] = {"ok": gpu_ok, "reason": gpu_reason, "hint": gpu_hint}
+    connected = bool(data.get("timestamp")) and not status.get("last_error")
+    return {"version": __version__, "poll_interval": POLL_INTERVAL, "stale": stale,
+            "socket_exists": os.path.exists(DOCKER_SOCKET), "socket_accessible": os.access(DOCKER_SOCKET, os.R_OK | os.W_OK),
+            "docker": {"ok": connected, "reason": "Connected." if connected else "Docker connection unavailable.", "hint": "" if connected else "Check daemon availability, socket mount and socket group permissions."},
+            "measurements": measurements, "host_last_sample": points[-1]["timestamp"] if points else None,
+            "hidden_containers": data.get("hidden_containers", 0), "total_containers": data.get("inventory_total", data.get("total_containers", 0)),
+            "history": {"size": len(points), "capacity": history.maxlen},
+            "poll_timing": status.get("poll_timing", {"last_ms": None, "average_ms": None}),
+            "process": status.get("process", {"cpu_pct": None, "ram_bytes": None}),
+            "last_error_hint": "Check Docker daemon, socket mount and group permissions." if status.get("last_error") else "",
+            **status}
 
 
 def background_poller():
@@ -948,9 +1005,9 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
             elif path == "/api/history":
                 self.send_json({"retention_seconds": 3600, "points": points})
             elif path == "/api/diagnostics":
-                self.send_json({"version": __version__, "poll_interval": POLL_INTERVAL, "stale": stale, "socket_exists": os.path.exists(DOCKER_SOCKET), "socket_accessible": os.access(DOCKER_SOCKET, os.R_OK | os.W_OK), "measurements": data.get("system", {}).get("availability", {}), **status})
+                self.send_json(diagnostics_payload(data, status, stale, points))
             else:
-                data["stale"] = stale
+                data.update(stale=stale, stale_after=STALE_AFTER, poll_interval=POLL_INTERVAL, last_error=status.get("last_error"))
                 self.send_json(data, 200 if timestamp else 503)
             return
         if path in ("/api/inspect", "/api/logs"):

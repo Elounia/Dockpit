@@ -18,7 +18,7 @@
 <main class="shell">
     <div class="status-line"><button id="issuesSummary" data-action="filter" data-value="issues">Waiting for health…</button><button id="dataWarning" data-action="diagnostics" class="hidden"></button></div>
     <div class="host-metrics-grid">
-<button class="summary-tile" data-action="card" data-value="cpu"><span class="muted">CPU</span><span class="big-value" id="sysCpu">—</span><span class="thin-bar"><span id="sysCpuBar"></span></span><span class="tile-sub" id="sysCpuCores">—</span></button>
+<button class="summary-tile" data-action="card" data-value="cpu" aria-label="Host CPU details"><span class="muted">CPU</span><span class="big-value" id="sysCpu">—</span><span class="thin-bar"><span id="sysCpuBar"></span></span><span class="tile-sub" id="sysCpuCores">—</span></button>
 <button class="summary-tile" data-action="card" data-value="memory"><span class="muted">RAM</span><span class="big-value" id="sysRam">—</span><span class="thin-bar"><span id="sysRamBar"></span></span><span class="tile-sub" id="sysRamSub">—</span></button>
 <button class="summary-tile" data-action="card" data-value="storage"><span class="muted">Storage</span><span class="big-value" id="sysNvmeStats">—</span><span class="thin-bar"><span id="sysNvmeBar"></span></span><span class="tile-sub" id="storageSub">—</span></button>
 <button class="summary-tile" data-action="card" data-value="system"><span class="muted">Containers</span><span class="big-value" id="sysHealth">—</span><span class="thin-bar"><span id="sysHealthBar"></span></span><span class="tile-sub" id="sysUptime">—</span></button>
@@ -35,7 +35,6 @@
 <button data-action="filter" data-value="secondary" id="qf-secondary" class="qf-btn">Secondary storage</button>
 <button data-action="filter" data-value="root" id="qf-root" class="qf-btn">Root storage</button>
 </div></details>
-        <button data-action="organize">Organize stacks</button>
         <button data-action="expand" id="expandAll" aria-label="Expand all stacks" title="Expand all stacks">↕</button>
     </div>
     <section class="history-panel" aria-label="Host resource history">
