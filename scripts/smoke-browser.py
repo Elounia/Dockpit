@@ -15,6 +15,10 @@ def main():
     attack = '<img src=x onerror="window.dockpitXss=1">'
     system = app.get_system_metrics()
     system.update(host_cpu_pct=20, mem_pct=30)
+    system['gpu'] = {'utilization_pct': 42, 'memory_used_bytes': 512 * 1024**2, 'memory_total_bytes': 8 * 1024**3,
+                     'devices': [{'id': 'GPU-demo', 'name': attack, 'vendor': 'NVIDIA', 'utilization_pct': 42,
+                                  'memory_used_bytes': 512 * 1024**2, 'memory_total_bytes': 8 * 1024**3,
+                                  'temperature_c': 55, 'power_w': 80}]}
     rows = []
     for name, state, status in [('broken', 'running', 'Up (unhealthy)'), ('stopped', 'exited', 'Exited (1)')]:
         c = {'Id': name.ljust(64, 'a'), 'Names': ['/' + name], 'State': state, 'Status': status, 'Image': attack, 'Labels': {'com.docker.compose.project': 'demo', 'dockpit.name': attack, 'dockpit.url': 'https://example.com/app'}}
@@ -22,7 +26,9 @@ def main():
             row = app.fetch_single_container_stats(c, system['mem_total_bytes'], system['cpus'])
         row['ports'] = '0.0.0.0:8080->80/tcp'
         rows.append(row)
+    rows[0].update(cpu_perc=12.5, mem_used_bytes=64 * 1024**2, pids=3)
     app.cached_data = app.aggregate_snapshot(rows, system, 'socket')
+    rows[0].update(gpu_perc=25, gpu_memory_bytes=256 * 1024**2, gpu_stats_available=True)
     app.history.extend([{'timestamp': time.time()-10, 'host_cpu': 10, 'host_memory': 25}, {'timestamp': time.time(), 'host_cpu': 20, 'host_memory': 30}])
     inspect = {'Name': '/broken', 'State': {'Status': 'running', 'OOMKilled': True, 'ExitCode': 137}, 'RestartCount': 2, 'Mounts': [{'Source': attack, 'Destination': attack, 'Type': 'bind'}], 'NetworkSettings': {'Networks': {attack: {'IPAddress': '172.18.0.2'}}}}
     server = app.ThreadingHTTPServer(('127.0.0.1', 0), app.DockerCockpitHandler)
@@ -37,12 +43,49 @@ def main():
             page.on('console', lambda msg: csp_errors.append(msg.text) if 'Content Security Policy' in msg.text or 'Refused to' in msg.text else None)
             page.on('request', lambda request: external.append(request.url) if not request.url.startswith('http://127.0.0.1:') else None)
             page.goto(f'http://127.0.0.1:{server.server_port}', wait_until='networkidle')
-            page.get_by_text('Expand All', exact=True).click()
+            page.set_default_timeout(10000)
+            assert page.locator('#issuesSummary').inner_text() == '2 need attention'
+            assert page.locator('.container-row').count() == 0
+            page.locator('#issuesSummary').click()
+            assert page.locator('#qf-issues').get_attribute('aria-pressed') == 'true'
+            page.locator('#qf-all').click()
+            assert not page.locator('#qf-cpu').is_visible()
+            page.locator('.filters summary').click()
+            page.locator('#qf-ports').click()
+            assert page.locator('.filters').get_attribute('open') is None
+            page.locator('#qf-all').click()
+            page.locator('[data-range="900"]').click()
+            assert page.evaluate('historyChart.range') == 900
+            page.locator('[data-range="3600"]').click()
+            assert page.evaluate('historyChart.range') == 3600
+            page.locator('[data-range="300"]').click()
+            page.locator('#hostHistory').hover()
+            assert page.locator('#historyTooltip').is_visible()
+            assert 'CPU' in page.locator('#historyTooltip').inner_text()
+            page.mouse.move(0,0)
+            page.wait_for_timeout(350)
+            assert page.evaluate('historyChart.frame') == 0
+            assert page.evaluate("() => { const segments=[]; historyChart.curve({moveTo(){},bezierCurveTo(...v){segments.push(v)}}, [{x:0,y:0},{x:10,y:100},{x:20,y:5}]); return segments.every((s,i) => { const a=[0,100][i], b=s[5]; for(let t=0;t<=1;t+=.01){const y=(1-t)**3*a+3*(1-t)**2*t*s[1]+3*(1-t)*t*t*s[3]+t**3*b; if(y<Math.min(a,b)-1e-6 || y>Math.max(a,b)+1e-6)return false;} return true; }); }")
+            requests = []
+            page.on('request', lambda request: requests.append(request.url) if '/api/' in request.url else None)
+            page.evaluate("() => { Object.defineProperty(document,'hidden',{value:true,configurable:true}); document.dispatchEvent(new Event('visibilitychange')); }")
+            requests.clear()
+            page.wait_for_timeout(1300)
+            assert not requests, requests
+            page.evaluate("() => { Object.defineProperty(document,'hidden',{value:false,configurable:true}); document.dispatchEvent(new Event('visibilitychange')); }")
+            page.wait_for_timeout(400)
+            assert any('/api/history?since=' in url and not url.endswith('=0') for url in requests), requests
+            page.get_by_role('button', name='Expand all stacks', exact=True).click()
             assert page.locator('#stacksContainer').inner_text().count(attack) >= 2
             assert page.locator('#stacksContainer img').count() == 0
             assert page.evaluate('window.dockpitXss') is None
             assert page.locator('#qf-issues').inner_text() == 'Needs attention (2)'
-            assert page.locator('#cpuHistory polyline').count() == 1, (errors, csp_errors)
+            assert page.locator('#hostHistory').evaluate('(el) => el.width > 0'), (errors, csp_errors)
+            assert page.locator('#sysGpu').inner_text() == '42.0%'
+            assert page.locator('.host-metrics-grid').evaluate('(el) => getComputedStyle(el).gridTemplateColumns.split(" ").length') == 5
+            assert page.locator('#sysGpuName').inner_text() == attack
+            assert '25.0%' in page.locator('#stacksContainer').inner_text()
+            assert 'VRAM 256 MB' in page.locator('#stacksContainer').inner_text()
             links = page.locator('#stacksContainer a').evaluate_all('(links) => links.map(link => link.href)')
             assert 'http://127.0.0.1:8080/' in links, links
             assert 'https://example.com/app' in links
@@ -63,12 +106,20 @@ def main():
                 page.get_by_text('Download', exact=True).click()
             assert download.value.suggested_filename == 'broken.log'
             page.locator('[data-action=close]').click()
-            page.get_by_text('Diagnostics', exact=True).click()
+            page.locator('#systemIndicator').click()
             page.wait_for_function("() => document.getElementById('diagnosticsText')?.textContent.includes('socket_exists')")
+            assert 'Docker connection' in page.locator('#diagnosticsPanel').inner_text()
+            assert not page.locator('#diagnosticsText').is_visible()
+            page.locator('.raw-details summary').click()
+            assert page.locator('#diagnosticsText').is_visible()
             page.locator('[data-action=close]').click()
-            for card in ['cpu', 'memory', 'storage', 'system']:
+            for card in ['cpu', 'gpu', 'memory', 'storage', 'system']:
                 page.locator(f'[data-action=card][data-value={card}]').click()
                 assert page.locator('#modalContent').inner_text()
+                if card == 'gpu':
+                    assert attack in page.locator('#modalContent').inner_text()
+                    assert page.locator('#modalContent img').count() == 0
+                    assert '55.0 °C' in page.locator('#modalContent').inner_text()
                 page.locator('[data-action=close]').click()
             page.locator('#sortBy').select_option('name')
             page.reload(wait_until='networkidle')
@@ -82,6 +133,30 @@ def main():
             page.set_viewport_size({'width': 390, 'height': 844})
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Mobile layout overflows'
             page.screenshot(path='/tmp/dockpit-browser-mobile.png', full_page=True)
+            # Intel integrated memory must not be displayed as missing VRAM.
+            app.cached_data['system']['gpu'] = {
+                'utilization_pct': None, 'memory_used_bytes': None, 'memory_total_bytes': None,
+                'devices': [{'id': 'card1', 'name': 'Intel UHD Graphics 730', 'vendor': 'Intel',
+                             'utilization_pct': None, 'memory_kind': 'shared',
+                             'memory_used_bytes': None, 'memory_total_bytes': None,
+                             'frequency_mhz': 0, 'max_frequency_mhz': 1450,
+                             'temperature_c': None, 'power_w': None,
+                             'utilization_note': attack, 'memory_note': 'Uses system RAM dynamically.'}]}
+            page.locator('[data-action=refresh]').click()
+            page.wait_for_function("() => document.getElementById('sysGpuName').textContent === 'No usage data'")
+            assert page.locator('#sysGpu').inner_text() == 'Intel UHD Graphics 730'
+            assert page.locator('#sysGpuBar').evaluate('(el) => el.style.width') == '0%'
+            page.locator('[data-action=card][data-value=gpu]').click()
+            content = page.locator('#modalContent').inner_text()
+            assert 'GPU load:' in content and 'Not measured' in content
+            assert 'Memory:' in content and 'Shared system RAM' in content
+            assert 'Current clock:' in content and '0 MHz' in content
+            assert 'Configured max clock:' in content and '1450 MHz' in content
+            assert 'Temperature:' not in content and 'Power:' not in content
+            assert attack in content and page.locator('#modalContent img').count() == 0
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            page.screenshot(path='/tmp/dockpit-intel-mobile.png', full_page=True)
+            page.locator('[data-action=close]').click()
             assert not errors, errors
             assert not external, external
             assert not csp_errors, csp_errors

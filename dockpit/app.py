@@ -24,6 +24,7 @@ from pathlib import Path
 from collections import deque
 from contextlib import closing
 from . import __version__
+from .history import HostSampler, TieredHistory
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -37,7 +38,9 @@ if not 0.5 <= POLL_INTERVAL <= 3600:
     raise ValueError("DOCKPIT_POLL_INTERVAL must be between 0.5 and 3600 seconds")
 MAX_LOG_BYTES = 1024 * 1024
 STALE_AFTER = max(30, POLL_INTERVAL * 3)
-history = deque(maxlen=7200)
+history = TieredHistory()
+host_sampler = HostSampler()
+host_sample = {}
 api_slots = threading.BoundedSemaphore(4)
 poll_status = {"last_attempt": None, "last_success": None, "last_error": None, "backend": None}
 poll_durations = deque(maxlen=60)
@@ -93,11 +96,6 @@ cache_lock = threading.Lock()
 # Persistent CPU cache to measure container deltas accurately across polls
 _container_cpu_cache = {}
 _cpu_cache_lock = threading.Lock()
-
-# CPU measurement state for host
-prev_cpu_idle = 0
-prev_cpu_total = 0
-_previous_cpu = None
 
 # Hardware cache to avoid heavy repetitive disk/proc scanning on rapid polls
 _hw_cache = {
@@ -462,25 +460,14 @@ def get_docker_engine_details():
 
 
 def get_system_metrics():
-    global prev_cpu_idle, prev_cpu_total
     cpus = os.cpu_count() or 1
 
-    # 1. System Host CPU %
-    host_cpu_pct = None
-    try:
-        with open(os.path.join(PROC_DIR, "stat"), "r") as f:
-            fields = [float(x) for x in f.readline().split()[1:9]]
-            idle = fields[3] + (fields[4] if len(fields) > 4 else 0.0)
-            total = sum(fields)
-            if prev_cpu_total > 0:
-                idle_delta = idle - prev_cpu_idle
-                total_delta = total - prev_cpu_total
-                if total_delta > 0:
-                    host_cpu_pct = max(0.0, min(100.0, 100.0 * (1.0 - (idle_delta / total_delta))))
-            prev_cpu_idle = idle
-            prev_cpu_total = total
-    except Exception:
-        pass
+    # The independent sampler owns /proc CPU deltas; Docker polling only reads its snapshot.
+    with cache_lock:
+        sampled = dict(host_sample)
+    if not sampled:
+        sampled = HostSampler().read(PROC_DIR, time.time())
+    host_cpu_pct = sampled.get("host_cpu")
 
     # Load avg
     try:
@@ -500,23 +487,11 @@ def get_system_metrics():
     m = int((uptime_sec % 3600) // 60)
     uptime_str = f"{d}d {h}h {m}m" if d > 0 else f"{h}h {m}m"
 
-    # 2. System Host RAM
-    mem_total, mem_avail = 0, 0
-    mem_avail_read = False
-    try:
-        with open(os.path.join(PROC_DIR, "meminfo"), "r") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    mem_total = int(line.split()[1]) * 1024
-                elif line.startswith("MemAvailable:"):
-                    mem_avail = int(line.split()[1]) * 1024
-                    mem_avail_read = True
-    except Exception:
-        pass
-    memory_available = mem_total > 0 and mem_avail_read
-
-    mem_used = mem_total - mem_avail
-    mem_pct = round((mem_used / mem_total) * 100.0, 1) if memory_available else None
+    mem_total = sampled.get("mem_total_bytes", 0)
+    mem_avail = sampled.get("mem_available_bytes")
+    memory_available = bool(mem_total) and mem_avail is not None
+    mem_used = mem_total - (mem_avail or 0)
+    mem_pct = sampled.get("host_memory")
 
     # 3. System Storage / Disks (Root system disk and optional secondary data disk)
     try:
@@ -791,9 +766,6 @@ def poll_once():
         with cache_lock:
             cached_data = data
             poll_status.update(last_attempt=attempted, last_success=data["timestamp"], last_error=None, backend=data["backend"])
-            history.append({"timestamp": data["timestamp"], "host_cpu": data["system"]["host_cpu_pct"], "host_memory": data["system"]["mem_pct"], "docker_cpu": data["docker_host_cpu_perc"], "docker_memory": data["docker_total_mem_bytes"]})
-            while history and history[0]["timestamp"] < attempted - 3600:
-                history.popleft()
         return True
     except Exception as error:
         # Keep the worker alive; do not log daemon payloads or command output.
@@ -841,16 +813,41 @@ def diagnostics_payload(data, status, stale, points):
     gpu_hint = "" if gpu_ok else ("/dev/dri is not mounted. Mount it to expose GPU device counters." if devices and not os.path.exists("/dev/dri") and any(d.get("vendor") in ("Intel", "AMD") for d in devices) else "Check GPU device mounts and driver metric support." if devices else "If a GPU is expected, check device mounts and driver visibility.")
     measurements["GPU"] = {"ok": gpu_ok, "reason": gpu_reason, "hint": gpu_hint}
     connected = bool(data.get("timestamp")) and not status.get("last_error")
+    host_timestamp = points[-1]["timestamp"] if points else None
+    host_fresh = host_timestamp is not None and time.time() - host_timestamp <= 5
+    freshness = {"ok": not stale and host_fresh,
+                 "reason": "Measurements are current." if not stale and host_fresh else "Docker measurements are stale." if stale else "Host sampler has no recent data.",
+                 "hint": "Check Docker daemon access and the poll interval." if stale else "Check host /proc mounts and restart Dockpit if the sampler has stopped." if not host_fresh else ""}
     return {"version": __version__, "poll_interval": POLL_INTERVAL, "stale": stale,
             "socket_exists": os.path.exists(DOCKER_SOCKET), "socket_accessible": os.access(DOCKER_SOCKET, os.R_OK | os.W_OK),
             "docker": {"ok": connected, "reason": "Connected." if connected else "Docker connection unavailable.", "hint": "" if connected else "Check daemon availability, socket mount and socket group permissions."},
-            "measurements": measurements, "host_last_sample": points[-1]["timestamp"] if points else None,
+            "measurements": measurements, "freshness": freshness, "host_last_sample": host_timestamp,
             "hidden_containers": data.get("hidden_containers", 0), "total_containers": data.get("inventory_total", data.get("total_containers", 0)),
-            "history": {"size": len(points), "capacity": history.maxlen},
+            "history": {"size": len(points), "capacity": history.capacity},
             "poll_timing": status.get("poll_timing", {"last_ms": None, "average_ms": None}),
             "process": status.get("process", {"cpu_pct": None, "ram_bytes": None}),
             "last_error_hint": "Check Docker daemon, socket mount and group permissions." if status.get("last_error") else "",
             **status}
+
+
+def sample_host_once():
+    global host_sample
+    sample = host_sampler.read(PROC_DIR, time.time())
+    with cache_lock:
+        host_sample = sample
+        history.append(sample)
+
+
+def background_host_sampler():
+    # Fixed cadence independent of the (potentially slow) Docker stats collection.
+    deadline = time.monotonic()
+    while not stop_event.is_set():
+        sample_host_once()
+        deadline += 1
+        if deadline < time.monotonic():
+            deadline = time.monotonic() + 1
+        if stop_event.wait(max(0, deadline - time.monotonic())):
+            break
 
 
 def background_poller():
@@ -952,7 +949,10 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Expected when a hidden tab aborts an in-flight request.
 
     def send_json(self, data, code=200):
         self.send_body(json.dumps(data).encode("utf-8"), "application/json; charset=utf-8", code)
@@ -995,7 +995,8 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
             with cache_lock:
                 data = dict(cached_data)
                 status = dict(poll_status)
-                points = [dict(point) for point in history if point["timestamp"] >= time.time() - 3600]
+                points = history.points(time.time()) if path in ("/api/history", "/api/diagnostics") else []
+                sampled_host = dict(host_sample)
             timestamp = data.get("timestamp", 0)
             stale = not timestamp or time.time() - timestamp > STALE_AFTER
             if path == "/healthz":
@@ -1003,10 +1004,25 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
             elif path == "/readyz":
                 self.send_json({"ready": not stale, "stale": stale}, 503 if stale else 200)
             elif path == "/api/history":
-                self.send_json({"retention_seconds": 3600, "points": points})
+                try:
+                    since = float(params.get("since", ["0"])[0])
+                    if not 0 <= since <= time.time() + 60:
+                        raise ValueError()
+                except ValueError:
+                    self.send_json({"error": "Invalid history cursor"}, 400)
+                    return
+                # A restart can put the client's cursor ahead of the new history.
+                reset = bool(points and since > points[-1]["timestamp"])
+                self.send_json({"retention_seconds": 3600, "points": [p for p in points if reset or p["timestamp"] > since],
+                                "reset": reset, "cursor": points[-1]["timestamp"] if points else 0})
             elif path == "/api/diagnostics":
-                self.send_json(diagnostics_payload(data, status, stale, points))
+                diagnostic_data = {**data, "system": {**data.get("system", {}), **({"host_cpu_pct": sampled_host.get("host_cpu"), "mem_pct": sampled_host.get("host_memory")} if sampled_host else {})}}
+                self.send_json(diagnostics_payload(diagnostic_data, status, stale, points))
             else:
+                if sampled_host:
+                    system = dict(data.get("system", {}))
+                    system.update(host_cpu_pct=sampled_host.get("host_cpu"), mem_pct=sampled_host.get("host_memory"))
+                    data["system"] = system
                 data.update(stale=stale, stale_after=STALE_AFTER, poll_interval=POLL_INTERVAL, last_error=status.get("last_error"))
                 self.send_json(data, 200 if timestamp else 503)
             return
@@ -1052,6 +1068,8 @@ class DockerCockpitHandler(BaseHTTPRequestHandler):
 def main():
     print(f"Starting Dockpit {__version__}")
     stop_event.clear()
+    sampler = threading.Thread(target=background_host_sampler, daemon=True)
+    sampler.start()
     poll_once()
     poller = threading.Thread(target=background_poller, daemon=True)
     poller.start()
@@ -1065,6 +1083,7 @@ def main():
         stop_event.set()
         server.server_close()
         poller.join(timeout=1)
+        sampler.join(timeout=1)
 
 
 if __name__ == "__main__":

@@ -25,3 +25,23 @@ Inspection allows Name; State status, OOMKilled, timestamps, exit code and PID; 
 Invalid or unknown container identifiers and invalid tail counts return HTTP 400. Runtime inspection/log failures return HTTP 502 with generic errors. At most four inspection/log requests run concurrently; excess requests return HTTP 429. Unknown routes return HTTP 404. HEAD returns the same headers and no body. Mutating HTTP methods are unsupported.
 
 History is sampled after successful polls, held in memory, bounded to 7200 points and one hour, and lost on restart. No synthetic zero samples are added when polling fails.
+
+### Host history and system status
+
+Host CPU/RAM use a separate one-second procfs sampler; Docker polling keeps
+`DOCKPIT_POLL_INTERVAL`. `/api/history?since=<last cursor>` returns only newer
+points, plus `cursor` and `reset`. Fetch without `since` initially. On `reset`,
+replace the local buffer. Retention is one hour: 300 recent one-second points
+and up to 330 ten-second means, with a fixed capacity of 630. Missing values
+remain null; coarse points include per-metric `counts` for weighted merging.
+The in-memory history resets when Dockpit restarts.
+
+`/api/diagnostics` includes `measurements` keyed by CPU, RAM, Storage and GPU;
+each has `ok`, a short `reason`, and an actionable `hint` when unavailable.
+`docker` reports backend connectivity and a fix hint. `poll_timing.last_ms`
+and `average_ms` cover the last poll and the latest 60 attempts, including
+failures. `process.cpu_pct` is Dockpit CPU as percent of one core between
+attempts; `ram_bytes` is resident memory. `hidden_containers`, `total_containers`
+(including hidden), `host_last_sample`, and `history.size/capacity` describe
+inventory and sampler state. Raw diagnostics remain available in the UI for
+copying into bug reports. GPU detection behavior is unchanged.

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — 2026-11-01
+
+- Redesign the overview with neutral surfaces, compact resource tiles and a single health status line.
+- Show stacks as flat CPU/RAM rows; expand containers and open details or logs in a side drawer.
+- Consolidate toolbar filters and merge freshness and diagnostics into an actionable system-status checklist.
+- Report measurement reasons and fixes, poll duration, Dockpit CPU/RAM, hidden inventory and history capacity.
+- Sample host CPU/RAM independently every second with a fixed 630-sample, tiered one-hour buffer and history deltas.
+- Replace sparklines with a full-width canvas chart, monotone curves, range controls, and hover values.
+- Limit chart animation to 300 ms per new sample and suspend client polling, log refresh and rendering in hidden tabs.
+- Refresh the dashboard screenshot; retain offline assets, CSP, and zero runtime dependencies.
+
 ## 1.1.0 — 2026-10-31
 
 - Fix socket health classification, stopped-container inventory and CLI snapshot compatibility.

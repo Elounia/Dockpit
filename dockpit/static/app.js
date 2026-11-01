@@ -83,11 +83,13 @@ function getStackIcon(name) {
 }
 
 let statsPending = false;
+let statsAbort = null;
 async function fetchStats(force = false) {
     if (statsPending || document.hidden || (!autoRefresh && !force)) return;
     statsPending = true;
+    statsAbort = new AbortController();
     try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/stats', {signal: statsAbort.signal});
         if (!res.ok) throw new Error('API returned status ' + res.status);
         const data = await res.json();
         latestData = data;
@@ -97,8 +99,9 @@ async function fetchStats(force = false) {
 
         updateSystemIndicator(data);
         renderIssues(data);
-        refreshHistory();
+
     } catch (err) {
+        if (err.name === 'AbortError') return;
         console.error('Error fetching stats:', err);
         updateSystemIndicator(latestData, true);
     } finally { statsPending = false; }
@@ -134,7 +137,7 @@ function updateTopKPIs(data) {
     text('sysCpuCores', `${sys.cpus || 1} cores · Docker ${(data.docker_host_cpu_perc || 0).toFixed(1)}%`);
     bar('sysCpuBar', sys.host_cpu_pct);
     text('sysRam', sys.mem_used_formatted || 'Unavailable');
-    text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct ?? '—'}%`);
+    text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct == null ? '—' : sys.mem_pct.toFixed(1)}%`);
     bar('sysRamBar', sys.mem_pct);
     const disk = sys.root_disk || {};
     text('sysNvmeStats', disk.total_bytes == null ? 'Unavailable' : formatBytesNoDec(disk.used_bytes));
@@ -187,10 +190,13 @@ function toggleAutoRefresh() {
         btnText.textContent = 'Pause';
         btnIcon.className = 'fa-solid fa-pause';
         startInterval();
+        historyChart.start();
+        fetchStats();
     } else {
         btnText.textContent = 'Start';
         btnIcon.className = 'fa-solid fa-play';
         clearInterval(refreshInterval);
+        historyChart.stop();
     }
 }
 
@@ -204,6 +210,26 @@ function startInterval() {
 // ==========================================
 // TOP 4 CARDS INTERACTIVE MODALS
 // ==========================================
+function openGpuStatus(gpu) {
+    const devices = gpu.devices || [];
+    const number = (value, suffix) => value == null ? 'Not measured' : `${value.toFixed(1)}${suffix}`;
+    const bytes = value => value == null ? 'Unavailable' : formatBytesNoDec(value);
+    const content = devices.map(device => `<section class="gpu-device">
+        <h4>${device.name}</h4><p class="muted">${device.vendor || ''}</p>
+        <div class="diagnostic-facts">
+            <div>GPU load: <span>${number(device.utilization_pct, '%')}</span></div>
+            <div>${device.memory_kind === 'shared' ? 'Memory: <span>Shared system RAM</span>' : `VRAM: <span>${bytes(device.memory_used_bytes)} / ${bytes(device.memory_total_bytes)}</span>`}</div>
+            ${device.frequency_mhz == null ? '' : `<div>Current clock: <span>${device.frequency_mhz.toFixed(0)} MHz</span></div>`}
+            ${device.max_frequency_mhz == null ? '' : `<div>Configured max clock: <span>${device.max_frequency_mhz.toFixed(0)} MHz</span></div>`}
+            ${device.temperature_c == null ? '' : `<div>Temperature: <span>${number(device.temperature_c, ' °C')}</span></div>`}
+            ${device.power_w == null ? '' : `<div>Power: <span>${number(device.power_w, ' W')}</span></div>`}
+        </div>
+        ${device.utilization_note ? `<p class="muted">${device.utilization_note}</p>` : ''}
+        ${device.memory_note ? `<p class="muted">${device.memory_note}</p>` : ''}
+    </section>`).join('') || '<p class="muted">No GPU detected.</p>';
+    openModal('GPU', 'Device measurements', content, '', () => fetchStats(true).then(() => openTopCardModal('gpu')));
+}
+
 function openTopCardModal(type) {
     if (!latestData) return;
     const sys = escapedView(latestData.system || {});
@@ -211,6 +237,8 @@ function openTopCardModal(type) {
 
     if (type === 'cpu') {
         renderCpuDetailsModal(sys, details.cpu || {});
+    } else if (type === 'gpu') {
+        openGpuStatus(sys.gpu || {});
     } else if (type === 'memory') {
         renderMemoryDetailsModal(sys, details.memory || {});
     } else if (type === 'storage') {
@@ -819,7 +847,8 @@ function renderContainerRow(container) {
         <span class="row-metric">${c.cpu_perc.toFixed(1)}% CPU · ${c.mem_used_formatted || '0 B'} RAM</span>
         <button data-action="logs" data-value="${c.name}">Logs</button></div>
         <div class="container-meta"><span>${c.image}</span>${ports ? `<span>${ports}</span>` : ''}<span>Network ↓ ${c.net_rx || '—'} ↑ ${c.net_tx || '—'}</span>
-        ${c.app_url ? `<a href="${c.app_url}" target="_blank" rel="noopener noreferrer">Open app</a>` : ''}</div>
+        ${c.gpu_stats_available ? `<span>GPU ${(c.gpu_perc == null ? 'Unavailable' : c.gpu_perc.toFixed(1) + '%')} · VRAM ${(c.gpu_memory_bytes == null ? 'Unavailable' : formatBytesNoDec(c.gpu_memory_bytes))}</span>` : ''}
+        ${c.url ? `<a href="${c.url}" target="_blank" rel="noopener noreferrer">Open app</a>` : ''}</div>
     </div>`;
 }
 
@@ -1039,42 +1068,8 @@ function updateSystemIndicator(data, failed = false) {
     warning.textContent = error ? 'Polling failed · Check system status' : 'Data is stale · Check system status';
     warning.classList.toggle('hidden', !error && !stale);
 }
-let historyFetched = 0;
-async function refreshHistory(force = false) {
-    if (!force && Date.now() - historyFetched < 15000) return;
-    historyFetched = Date.now();
-    try {
-        const res = await fetch('/api/history');
-        if (!res.ok) throw new Error('History unavailable');
-        const {points} = await res.json();
-        drawSparkline('cpuHistory', points, 'host_cpu', '#fbbf24');
-        drawSparkline('memoryHistory', points, 'host_memory', '#c084fc');
-        document.getElementById('historyStatus').textContent = `${points.length} samples · up to 60 minutes · kept in memory`;
-    } catch { document.getElementById('historyStatus').textContent = 'History unavailable'; }
-}
-function drawSparkline(id, points, metric, color) {
-    const svg = document.getElementById(id);
-    svg.replaceChildren();
-    const valid = points.filter(p => Number.isFinite(p[metric]));
-    if (!valid.length) return;
-    const end = points[points.length - 1].timestamp;
-    const start = Math.min(points[0].timestamp, end - 1);
-    let segment = [];
-    function flush() {
-        if (!segment.length) return;
-        const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
-        poly.setAttribute('points', segment.join(' '));
-        poly.setAttribute('fill','none'); poly.setAttribute('stroke', color); poly.setAttribute('stroke-width','2');
-        svg.append(poly); segment = [];
-    }
-    let previous = null;
-    for (const point of points) {
-        if (!Number.isFinite(point[metric]) || (previous && point.timestamp - previous.timestamp > 30)) flush();
-        if (Number.isFinite(point[metric])) segment.push(`${(point.timestamp-start)/(end-start)*400},${58-Math.max(0,Math.min(100,point[metric]))/100*54}`);
-        previous = point;
-    }
-    flush();
-}
+const historyChart = new HostHistoryChart(document.getElementById('hostHistory'), document.getElementById('historyTooltip'), document.getElementById('historyStatus'));
+document.querySelectorAll('[data-range]').forEach(button => button.addEventListener('click', () => historyChart.setRange(Number(button.dataset.range))));
 async function showDiagnostics() {
     openModal('System status', 'Docker connectivity, measurement availability and polling cost', '<div id="diagnosticsPanel">Loading…</div>', 'fa-circle-info', showDiagnostics);
     const generation = modalGeneration;
@@ -1085,9 +1080,9 @@ async function showDiagnostics() {
         if (generation !== modalGeneration) return;
         const row = (title, ok, detail) => `<div class="diagnostic-row"><span class="${ok ? 'check-ok' : 'check-fail'}">${ok ? '✓' : '✗'}</span><div><strong>${escapeHtml(title)}</strong><p class="muted">${escapeHtml(detail)}</p></div></div>`;
         let content = row('Docker connection', data.docker.ok, `${data.backend || 'No backend'} · Socket ${data.socket_exists ? data.socket_accessible ? 'accessible' : 'not accessible' : 'missing'}. ${data.docker.reason} ${data.docker.hint}`);
-        content += row('Data freshness', !data.stale, `Docker ${relativeTime(data.last_success)} · Host ${relativeTime(data.host_last_sample)} · Polling every ${data.poll_interval}s. ${data.stale ? 'Check Docker access and the configured poll interval.' : ''}`);
+        content += row('Data freshness', data.freshness.ok, `Docker ${relativeTime(data.last_success)} · Host ${relativeTime(data.host_last_sample)} · Polling every ${data.poll_interval}s. ${data.freshness.reason} ${data.freshness.hint}`);
         for (const [key, measurement] of Object.entries(data.measurements)) content += row(key, measurement.ok, `${measurement.reason} ${measurement.hint}`);
-        content += `<div class="diagnostic-facts"><div>Poll duration <span>${data.poll_timing.last_ms?.toFixed(1) ?? '—'} ms last / ${data.poll_timing.average_ms?.toFixed(1) ?? '—'} ms average</span></div><div>Dockpit cost <span>${data.process.cpu_pct?.toFixed(2) ?? '—'}% CPU · ${formatBytesNoDec(data.process.ram_bytes)} RAM</span></div><div>Containers <span>${data.hidden_containers} hidden / ${data.total_containers} total</span></div><div>History buffer <span>${data.history.size} / ${data.history.capacity} samples</span></div></div>`;
+        content += `<div class="diagnostic-facts"><div>Poll duration <span>${data.poll_timing.last_ms?.toFixed(1) ?? '—'} ms last / ${data.poll_timing.average_ms?.toFixed(1) ?? '—'} ms average</span></div><div>Dockpit cost <span>${data.process.cpu_pct?.toFixed(2) ?? '—'}% CPU · ${data.process.ram_bytes == null ? 'Unavailable' : formatBytesNoDec(data.process.ram_bytes)} RAM</span></div><div>Containers <span>${data.hidden_containers} hidden / ${data.total_containers} total</span></div><div>History buffer <span>${data.history.size} / ${data.history.capacity} samples</span></div></div>`;
         if (data.last_error) content += row('Last error', false, `${data.last_error} ${data.last_error_hint}`);
         content += '<details class="raw-details"><summary>Raw</summary><button data-action="copy-diagnostics">Copy</button><pre id="diagnosticsText"></pre></details>';
         document.getElementById('diagnosticsPanel').innerHTML = content;
@@ -1136,3 +1131,17 @@ document.addEventListener('keydown', event => {
 });
 
 document.addEventListener('click', event => { const filters = document.querySelector('.filters'); if (!filters.contains(event.target) || event.target.closest('.qf-btn')) filters.open = false; });
+
+historyChart.start();
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearInterval(refreshInterval);
+        statsAbort?.abort();
+        historyChart.stop();
+        clearTimeout(logTimer);
+        logAbort?.abort();
+    } else {
+        if (autoRefresh) { fetchStats(); startInterval(); historyChart.start(); }
+        if (logState && !logState.paused) refreshLogs();
+    }
+});

@@ -38,8 +38,9 @@
         <button data-action="expand" id="expandAll" aria-label="Expand all stacks" title="Expand all stacks">↕</button>
     </div>
     <section class="history-panel" aria-label="Host resource history">
-        <div class="chart-heading"><span>Host activity <span class="chart-legend">CPU <span class="muted">/ RAM</span></span></span><span id="historyStatus" class="muted">Collecting samples…</span></div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4"><svg id="cpuHistory" viewBox="0 0 400 60" aria-label="CPU history" class="w-full h-16"></svg><svg id="memoryHistory" viewBox="0 0 400 60" aria-label="RAM history" class="w-full h-16"></svg></div>
+        <div class="chart-heading"><span>Host activity <span class="chart-legend">CPU <span class="muted">/ RAM · 0–100%</span></span></span><div class="segmented chart-ranges" aria-label="History range"><button data-range="300" aria-pressed="true">5m</button><button data-range="900" aria-pressed="false">15m</button><button data-range="3600" aria-pressed="false">1h</button></div></div>
+        <div class="chart-wrap"><canvas id="hostHistory" role="img" aria-label="Host CPU and RAM, fixed scale from 0 to 100 percent"></canvas><div id="historyTooltip" hidden></div></div>
+        <div class="chart-footer"><span id="historyStatus">Collecting samples…</span><span>Host CPU / RAM · last hour</span></div>
     </section>
     <div class="list-heading"><span>Stacks</span><span>CPU</span><span>RAM</span><span></span></div>
     <div id="stacksContainer"></div>
@@ -72,6 +73,7 @@
         </div>
     </div>
 
+    <script src="/static/history.js" defer></script>
     <script src="/static/app.js" defer></script>
 </body>
 </html>
