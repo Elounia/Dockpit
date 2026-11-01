@@ -196,7 +196,7 @@ function updateTopKPIs(data) {
     text('sysCpuCores', `${sys.cpus || 1} cores · Docker ${(data.docker_host_cpu_perc || 0).toFixed(1)}%`);
     bar('sysCpuBar', sys.host_cpu_pct);
     text('sysRam', sys.mem_used_formatted || 'Unavailable');
-    text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct == null ? '—' : sys.mem_pct.toFixed(1)}%`);
+    text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct == null ? '—' : sys.mem_pct.toFixed(1)}%\nDocker ${data.docker_total_mem_str ?? 'Unavailable'}`);
     bar('sysRamBar', sys.mem_pct);
 
     const disk = sys.root_disk || {};
@@ -248,6 +248,7 @@ function toggleStack(stackName) {
         expandedStacks.add(stackName);
     }
     renderDashboard();
+    checkAutoResort();
 }
 
 function toggleExpandAll(expand) {
@@ -258,6 +259,7 @@ function toggleExpandAll(expand) {
         expandedStacks.clear();
     }
     renderDashboard();
+    checkAutoResort();
 }
 
 function setQuickFilter(type) {
@@ -265,7 +267,7 @@ function setQuickFilter(type) {
     document.querySelectorAll('.qf-btn').forEach(btn => btn.setAttribute('aria-pressed', btn.dataset.value === activeQuickFilter));
     const extra = document.querySelector(`.filter-popover [data-value="${activeQuickFilter}"]`);
     document.querySelector('.filters summary').textContent = extra ? extra.textContent : 'More filters';
-    renderDashboard();
+    renderDashboard(true);
 }
 
 function toggleAutoRefresh() {
@@ -953,7 +955,370 @@ function assignStack(reset = false) {
     closeModal();
 }
 
-function renderDashboard() {
+// Stable list ordering state
+const renderedStacks = new Map();
+let currentStackOrder = [];
+let pendingStackOrder = null;
+let lastOrderEvalTime = 0;
+let isPointerOverList = false;
+let hasInitialRendered = false;
+
+function isUserEngaged() {
+    const hasExpanded = expandedStacks.size > 0;
+    const modalOpen = !document.getElementById('modalOverlay').classList.contains('hidden');
+    const hasOpenUsage = (typeof openStackUsages !== 'undefined' && openStackUsages.size > 0);
+    return hasExpanded || modalOpen || hasOpenUsage || isPointerOverList;
+}
+
+function updateOrderPausedPill() {
+    const pill = document.getElementById('orderPausedPill');
+    if (!pill) return;
+    const shouldShow = Boolean(pendingStackOrder && isUserEngaged());
+    pill.hidden = !shouldShow;
+}
+
+function checkAutoResort() {
+    if (!isUserEngaged() && pendingStackOrder) {
+        renderDashboard(true);
+    }
+}
+
+function hysteresisSort(items, prevKeyOrder, sortBy) {
+    if (sortBy === 'name') {
+        return [...items].sort((a, b) => a.name.localeCompare(b.name));
+    }
+    const getVal = item => {
+        if (sortBy === 'cpu') return item.total_cpu ?? item.cpu_perc ?? 0;
+        if (sortBy === 'mem') return item.total_mem_bytes ?? item.mem_used_bytes ?? 0;
+        if (sortBy === 'containers') return item.total_containers ?? 1;
+        return 0;
+    };
+    const prevIndexMap = new Map();
+    (prevKeyOrder || []).forEach((key, idx) => prevIndexMap.set(key, idx));
+
+    const sorted = [...items];
+    sorted.sort((a, b) => {
+        const hasA = prevIndexMap.has(a.key);
+        const hasB = prevIndexMap.has(b.key);
+        if (hasA && hasB) return prevIndexMap.get(a.key) - prevIndexMap.get(b.key);
+        if (hasA) return -1;
+        if (hasB) return 1;
+        return getVal(b) - getVal(a) || a.name.localeCompare(b.name);
+    });
+
+    let changed = true;
+    let maxPasses = sorted.length;
+    while (changed && maxPasses-- > 0) {
+        changed = false;
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const a = sorted[i];
+            const b = sorted[i + 1];
+            const valA = getVal(a);
+            const valB = getVal(b);
+
+            const margin = sortBy === 'cpu' ? Math.max(valA * 0.10, 0.05) :
+                           sortBy === 'mem' ? valA * 0.10 :
+                           sortBy === 'containers' ? 0.5 : 0;
+            const overtakes = (valB - valA) > margin;
+            const tiedAndNameWins = (valA === valB) && (b.name.localeCompare(a.name) < 0);
+
+            if (overtakes || tiedAndNameWins) {
+                sorted[i] = b;
+                sorted[i + 1] = a;
+                changed = true;
+            }
+        }
+    }
+    return sorted;
+}
+
+function createStackNode(key) {
+    const section = document.createElement('section');
+    section.className = 'stack-group';
+    section.dataset.stackKey = key;
+
+    const row = document.createElement('div');
+    row.className = 'stack-row';
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', '0');
+    row.dataset.action = 'stack';
+    row.dataset.value = key;
+
+    const nameCol = document.createElement('div');
+    nameCol.className = 'stack-name';
+    const dot = document.createElement('span');
+    dot.className = 'state-dot';
+    const title = document.createElement('h2');
+    title.className = 'stack-title';
+    const count = document.createElement('span');
+    count.className = 'stack-count';
+    nameCol.append(dot, title, count);
+
+    const cpuMetric = document.createElement('div');
+    cpuMetric.className = 'row-metric';
+    const cpuVal = document.createElement('span');
+    cpuVal.className = 'row-val';
+    const cpuThinBar = document.createElement('span');
+    cpuThinBar.className = 'thin-bar';
+    const cpuBar = document.createElement('span');
+    cpuThinBar.appendChild(cpuBar);
+    cpuMetric.append(cpuVal, cpuThinBar);
+
+    const memMetric = document.createElement('div');
+    memMetric.className = 'row-metric';
+    const memVal = document.createElement('span');
+    memVal.className = 'row-val';
+    const memThinBar = document.createElement('span');
+    memThinBar.className = 'thin-bar';
+    const memBar = document.createElement('span');
+    memThinBar.appendChild(memBar);
+    memMetric.append(memVal, memThinBar);
+
+    const actionsCol = document.createElement('div');
+    actionsCol.className = 'stack-actions';
+
+    const chevron = document.createElement('span');
+    chevron.className = 'stack-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.innerHTML = '<i class="fa-solid fa-chevron-right"></i>';
+
+    row.append(nameCol, cpuMetric, memMetric, actionsCol, chevron);
+
+    const usagePanel = document.createElement('div');
+    usagePanel.className = 'stack-usage-panel';
+    usagePanel.hidden = true;
+
+    const containersWrap = document.createElement('div');
+    containersWrap.className = 'stack-containers';
+    containersWrap.hidden = true;
+
+    section.append(row, usagePanel, containersWrap);
+
+    return {
+        section,
+        row,
+        dot,
+        title,
+        count,
+        cpuMetric,
+        cpuVal,
+        cpuBar,
+        memMetric,
+        memVal,
+        memBar,
+        actionsCol,
+        chevron,
+        usagePanel,
+        containersWrap,
+        containers: new Map(),
+        containerOrder: []
+    };
+}
+
+function createContainerNode(name) {
+    const row = document.createElement('div');
+    row.className = 'container-row';
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', '0');
+    row.dataset.action = 'inspect';
+    row.dataset.value = name;
+    row.dataset.containerKey = name;
+
+    const nameCol = document.createElement('div');
+    nameCol.className = 'container-col-name';
+    const dot = document.createElement('span');
+    dot.className = 'state-dot';
+    const title = document.createElement('strong');
+    title.className = 'container-title';
+    const stateLabel = document.createElement('span');
+    stateLabel.className = 'container-state-label';
+    nameCol.append(dot, title, stateLabel);
+
+    const cpuMetric = document.createElement('div');
+    cpuMetric.className = 'row-metric';
+    const cpuVal = document.createElement('span');
+    cpuVal.className = 'row-val';
+    const cpuThinBar = document.createElement('span');
+    cpuThinBar.className = 'thin-bar';
+    const cpuBar = document.createElement('span');
+    cpuThinBar.appendChild(cpuBar);
+    cpuMetric.append(cpuVal, cpuThinBar);
+
+    const memMetric = document.createElement('div');
+    memMetric.className = 'row-metric';
+    const memVal = document.createElement('span');
+    memVal.className = 'row-val';
+    const memThinBar = document.createElement('span');
+    memThinBar.className = 'thin-bar';
+    const memBar = document.createElement('span');
+    memThinBar.appendChild(memBar);
+    memMetric.append(memVal, memThinBar);
+
+    const actionsCol = document.createElement('div');
+    actionsCol.className = 'container-actions';
+    const extraMeta = document.createElement('span');
+    extraMeta.className = 'container-extra-meta flex items-center gap-2 truncate';
+    const logsBtn = document.createElement('button');
+    logsBtn.className = 'container-btn-logs';
+    logsBtn.dataset.action = 'logs';
+    logsBtn.dataset.value = name;
+    logsBtn.textContent = 'Logs';
+    actionsCol.append(extraMeta, logsBtn);
+
+    const trigger = document.createElement('span');
+    trigger.className = 'container-drawer-trigger';
+    trigger.setAttribute('aria-hidden', 'true');
+    trigger.innerHTML = '&rsaquo;';
+
+    row.append(nameCol, cpuMetric, memMetric, actionsCol, trigger);
+
+    return {
+        row,
+        dot,
+        title,
+        stateLabel,
+        cpuMetric,
+        cpuVal,
+        cpuBar,
+        memMetric,
+        memVal,
+        memBar,
+        actionsCol,
+        extraMeta,
+        logsBtn,
+        trigger
+    };
+}
+
+function patchStackNode(node, stack, isExpanded, maxCpu, maxMemBytes, cpus, hostMemTotal) {
+    const state = stack.containers.some(needsAttention) ? 'warning' : stack.containers.some(isRunning) ? '' : 'inactive';
+    const cpuBarWidth = calcBarWidth(stack.total_cpu, maxCpu);
+    const memBarWidth = calcBarWidth(stack.total_mem_bytes, maxMemBytes);
+    const hostCpuPct = stack.total_cpu / cpus;
+    const hostMemPct = stack.host_mem_perc || (stack.total_mem_bytes / hostMemTotal * 100);
+
+    node.row.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+    node.dot.className = `state-dot ${state}`;
+    if (node.title.textContent !== stack.name) node.title.textContent = stack.name;
+    const countText = `${stack.displayContainers.length} containers`;
+    if (node.count.textContent !== countText) node.count.textContent = countText;
+
+    const cpuText = `${stack.total_cpu.toFixed(1)}%`;
+    if (node.cpuVal.textContent !== cpuText) node.cpuVal.textContent = cpuText;
+    const cpuHostText = Number.isFinite(hostCpuPct) ? ` (${hostCpuPct.toFixed(1)}% of host)` : '';
+    node.cpuMetric.title = `${cpuText}${cpuHostText}`;
+    node.cpuBar.style.width = `${Math.max(0, Math.min(100, cpuBarWidth))}%`;
+    node.cpuBar.className = hostCpuPct > 25 ? 'warning' : '';
+
+    const memText = formatBytesNoDec(stack.total_mem_bytes);
+    if (node.memVal.textContent !== memText) node.memVal.textContent = memText;
+    const memHostText = Number.isFinite(hostMemPct) ? ` (${hostMemPct.toFixed(1)}% of host)` : '';
+    node.memMetric.title = `${memText}${memHostText}`;
+    node.memBar.style.width = `${Math.max(0, Math.min(100, memBarWidth))}%`;
+    node.memBar.className = hostMemPct > 25 ? 'warning' : '';
+
+    node.containersWrap.hidden = !isExpanded;
+}
+
+function patchContainerNode(node, container, maxCpu, maxMemBytes, cpus, hostMemTotal) {
+    const state = needsAttention(container) ? 'warning' : isRunning(container) ? '' : 'inactive';
+    const cCpuBarWidth = container.cpu_perc > 0 ? Math.max(3, Math.min(100, (container.cpu_perc / maxCpu) * 100)) : 0;
+    const cMemBarWidth = container.mem_used_bytes > 0 ? Math.max(3, Math.min(100, (container.mem_used_bytes / maxMemBytes) * 100)) : 0;
+    const cHostCpuPct = container.cpu_perc / cpus;
+    const cHostMemPct = (container.mem_used_bytes / hostMemTotal) * 100;
+
+    node.dot.className = `state-dot ${state}`;
+    const displayName = container.display_name || container.name;
+    if (node.title.textContent !== displayName) node.title.textContent = displayName;
+    const stateText = isStopped(container) ? 'stopped' : (container.health || container.state || '');
+    if (node.stateLabel.textContent !== stateText) node.stateLabel.textContent = stateText;
+
+    const cpuText = `${container.cpu_perc.toFixed(1)}%`;
+    if (node.cpuVal.textContent !== cpuText) node.cpuVal.textContent = cpuText;
+    const cpuHostText = Number.isFinite(cHostCpuPct) ? ` (${cHostCpuPct.toFixed(1)}% of host)` : '';
+    node.cpuMetric.title = `${cpuText}${cpuHostText}`;
+    node.cpuBar.style.width = `${Math.max(0, Math.min(100, cCpuBarWidth))}%`;
+    node.cpuBar.className = cHostCpuPct > 25 ? 'warning' : '';
+
+    const memText = container.mem_used_formatted || '0 B';
+    if (node.memVal.textContent !== memText) node.memVal.textContent = memText;
+    const memHostText = Number.isFinite(cHostMemPct) ? ` (${cHostMemPct.toFixed(1)}% of host)` : '';
+    node.memMetric.title = `${memText}${memHostText}`;
+    node.memBar.style.width = `${Math.max(0, Math.min(100, cMemBarWidth))}%`;
+    node.memBar.className = cHostMemPct > 25 ? 'warning' : '';
+
+    let extraHtml = '';
+    if (container.gpu_stats_available) {
+        const gpuPct = container.gpu_perc == null ? 'Unavailable' : `${container.gpu_perc.toFixed(1)}%`;
+        const vram = container.gpu_memory_bytes == null ? 'Unavailable' : formatBytesNoDec(container.gpu_memory_bytes);
+        extraHtml += `<span class="container-gpu-meta">GPU ${escapeHtml(gpuPct)} · VRAM ${escapeHtml(vram)}</span>`;
+    }
+    if (container.ports) {
+        const portLinks = container.ports.split(',').filter(Boolean).map(port => {
+            const match = port.match(/(?:^|:)(\d+)->/);
+            return match ? `<a href="${escapeHtml(portUrl(match[1]))}" target="_blank" rel="noopener noreferrer">${escapeHtml(port.trim())}</a>` : escapeHtml(port);
+        }).join(' · ');
+        if (portLinks) extraHtml += `<span class="container-ports-meta">${portLinks}</span>`;
+    }
+    if (container.url) {
+        extraHtml += `<a href="${escapeHtml(container.url)}" target="_blank" rel="noopener noreferrer" class="container-app-link">Open app</a>`;
+    }
+    if (node.extraMeta.innerHTML !== extraHtml) node.extraMeta.innerHTML = extraHtml;
+}
+
+function calcBarWidth(val, max) {
+    if (!val || val <= 0) return 0;
+    return Math.max(3, Math.min(100, (val / max) * 100));
+}
+
+function applyStackOrder(orderedKeys) {
+    const container = document.getElementById('stacksContainer');
+    if (!container) return;
+    const isReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const firstTops = new Map();
+    if (!isReduced) {
+        for (const child of container.children) {
+            if (child.dataset && child.dataset.stackKey) {
+                firstTops.set(child.dataset.stackKey, child.getBoundingClientRect().top);
+            }
+        }
+    }
+
+    for (const key of orderedKeys) {
+        const node = renderedStacks.get(key);
+        if (node && node.section) {
+            container.appendChild(node.section);
+        }
+    }
+    currentStackOrder = [...orderedKeys];
+
+    if (!isReduced) {
+        for (const child of container.children) {
+            const key = child.dataset?.stackKey;
+            if (key && firstTops.has(key)) {
+                const firstTop = firstTops.get(key);
+                const lastTop = child.getBoundingClientRect().top;
+                const deltaY = firstTop - lastTop;
+                if (Math.abs(deltaY) > 1) {
+                    child.style.transform = `translateY(${deltaY}px)`;
+                    child.style.transition = 'none';
+                    requestAnimationFrame(() => {
+                        child.style.transition = 'transform 200ms cubic-bezier(0.2, 0, 0, 1)';
+                        child.style.transform = '';
+                        const cleanup = () => {
+                            child.style.transition = '';
+                            child.removeEventListener('transitionend', cleanup);
+                        };
+                        child.addEventListener('transitionend', cleanup, { once: true });
+                    });
+                }
+            }
+        }
+    }
+}
+
+function renderDashboard(forceOrder = false) {
     const view = dashboardData();
     if (!latestData || !view.stacks) return;
 
@@ -992,16 +1357,6 @@ function renderDashboard() {
         }
     }
 
-    if (sortBy === 'cpu') {
-        filtered.sort((a, b) => b.total_cpu - a.total_cpu);
-    } else if (sortBy === 'mem') {
-        filtered.sort((a, b) => b.total_mem_bytes - a.total_mem_bytes);
-    } else if (sortBy === 'containers') {
-        filtered.sort((a, b) => b.total_containers - a.total_containers);
-    } else if (sortBy === 'name') {
-        filtered.sort((a, b) => a.name.localeCompare(b.name));
-    }
-
     if (filtered.length === 0) {
         containerEl.innerHTML = `
             <div class="glass-card rounded-2xl p-12 text-center text-slate-400">
@@ -1010,7 +1365,19 @@ function renderDashboard() {
                 <p class="text-xs text-slate-500 mt-1">Try resetting search filters or selecting another quick filter</p>
             </div>
         `;
+        renderedStacks.clear();
+        currentStackOrder = [];
+        pendingStackOrder = null;
+        updateOrderPausedPill();
         return;
+    }
+
+    // Clear empty state message if it was shown
+    const emptyState = containerEl.querySelector('.glass-card');
+    if (emptyState) {
+        containerEl.innerHTML = '';
+        renderedStacks.clear();
+        currentStackOrder = [];
     }
 
     // Determine the heaviest visible row for bar scaling
@@ -1033,42 +1400,103 @@ function renderDashboard() {
     if (maxCpu <= 0) maxCpu = 1;
     if (maxMemBytes <= 0) maxMemBytes = 1;
 
-    const calcBarWidth = (val, max) => {
-        if (!val || val <= 0) return 0;
-        return Math.max(3, Math.min(100, (val / max) * 100));
-    };
-
-    let html = '';
-    for (const stack of filtered) {
-        const isExpanded = (q && q.length > 0) || expandedStacks.has(stack.key);
-        const state = stack.containers.some(needsAttention) ? 'warning' : stack.containers.some(isRunning) ? '' : 'inactive';
-        const cpuBarWidth = calcBarWidth(stack.total_cpu, maxCpu);
-        const memBarWidth = calcBarWidth(stack.total_mem_bytes, maxMemBytes);
-        const hostCpuPct = stack.total_cpu / cpus;
-        const hostMemPct = stack.host_mem_perc || (stack.total_mem_bytes / hostMemTotal * 100);
-
-        html += `<section class="stack-group">
-            <div role="button" tabindex="0" aria-expanded="${Boolean(isExpanded)}" data-action="stack" data-value="${escapeHtml(stack.key)}" class="stack-row">
-                <div class="stack-name">
-                    <span class="state-dot ${state}"></span>
-                    <h2 class="stack-title">${escapeHtml(stack.name)}</h2>
-                    <span class="stack-count">${stack.displayContainers.length} containers</span>
-                </div>
-                ${rowMetric(`${stack.total_cpu.toFixed(1)}%`, cpuBarWidth, hostCpuPct, hostCpuPct > 25)}
-                ${rowMetric(formatBytesNoDec(stack.total_mem_bytes), memBarWidth, hostMemPct, hostMemPct > 25)}
-                <div></div>
-                <span class="stack-chevron" aria-hidden="true"><i class="fa-solid fa-chevron-right"></i></span>
-            </div>
-            ${isExpanded ? `<div>${stack.displayContainers.map(c => renderContainerRow(c, maxCpu, maxMemBytes)).join('')}</div>` : ''}
-        </section>`;
+    // Prune removed stacks from DOM & map
+    const activeStackKeys = new Set(filtered.map(s => s.key));
+    for (const [key, node] of renderedStacks.entries()) {
+        if (!activeStackKeys.has(key)) {
+            node.section.remove();
+            renderedStacks.delete(key);
+        }
     }
+
+    // Patch or create stack & container DOM elements
+    for (const stack of filtered) {
+        let node = renderedStacks.get(stack.key);
+        if (!node) {
+            node = createStackNode(stack.key);
+            renderedStacks.set(stack.key, node);
+            containerEl.appendChild(node.section);
+        }
+
+        const isExpanded = (q && q.length > 0) || expandedStacks.has(stack.key);
+        patchStackNode(node, stack, isExpanded, maxCpu, maxMemBytes, cpus, hostMemTotal);
+
+        if (isExpanded) {
+            // Update container rows inside stack
+            const activeContainerKeys = new Set(stack.displayContainers.map(c => c.name));
+            for (const [cName, cNode] of node.containers.entries()) {
+                if (!activeContainerKeys.has(cName)) {
+                    cNode.row.remove();
+                    node.containers.delete(cName);
+                }
+            }
+
+            // Containers stable sort
+            const sortedContainers = hysteresisSort(
+                stack.displayContainers.map(c => ({ ...c, key: c.name })),
+                node.containerOrder,
+                sortBy === 'name' ? 'name' : 'cpu'
+            );
+            node.containerOrder = sortedContainers.map(c => c.key);
+
+            for (let i = 0; i < sortedContainers.length; i++) {
+                const c = sortedContainers[i];
+                let cNode = node.containers.get(c.name);
+                if (!cNode) {
+                    cNode = createContainerNode(c.name);
+                    node.containers.set(c.name, cNode);
+                    node.containersWrap.appendChild(cNode.row);
+                }
+                patchContainerNode(cNode, c, maxCpu, maxMemBytes, cpus, hostMemTotal);
+                if (node.containersWrap.children[i] !== cNode.row) {
+                    node.containersWrap.appendChild(cNode.row);
+                }
+            }
+        } else if (node.containers.size > 0) {
+            node.containersWrap.replaceChildren();
+            node.containers.clear();
+            node.containerOrder = [];
+        }
+    }
+
+    // Expand/collapse button state
     const allExpanded = Object.keys(view.stacks).every(key => expandedStacks.has(key));
     const expand = document.getElementById('expandAll');
-    expand.setAttribute('aria-label', allExpanded ? 'Collapse all stacks' : 'Expand all stacks');
-    expand.title = expand.getAttribute('aria-label');
-    expand.textContent = allExpanded ? '−' : '↕';
+    if (expand) {
+        expand.setAttribute('aria-label', allExpanded ? 'Collapse all stacks' : 'Expand all stacks');
+        expand.title = expand.getAttribute('aria-label');
+        expand.textContent = allExpanded ? '−' : '↕';
+    }
 
-    containerEl.innerHTML = html;
+    // Ordering evaluation (decoupled from refresh)
+    const idealStacks = hysteresisSort(filtered, currentStackOrder, sortBy);
+    const idealKeys = idealStacks.map(s => s.key);
+    const now = Date.now();
+
+    if (!hasInitialRendered || forceOrder) {
+        applyStackOrder(idealKeys);
+        lastOrderEvalTime = now;
+        pendingStackOrder = null;
+        hasInitialRendered = true;
+        updateOrderPausedPill();
+    } else {
+        const orderChanged = idealKeys.length !== currentStackOrder.length || idealKeys.some((k, i) => k !== currentStackOrder[i]);
+        if (orderChanged) {
+            if (isUserEngaged()) {
+                pendingStackOrder = idealKeys;
+                updateOrderPausedPill();
+            } else if (now - lastOrderEvalTime >= 10000) {
+                applyStackOrder(idealKeys);
+                lastOrderEvalTime = now;
+                pendingStackOrder = null;
+                updateOrderPausedPill();
+            }
+        } else {
+            pendingStackOrder = null;
+            updateOrderPausedPill();
+            if (now - lastOrderEvalTime >= 10000) lastOrderEvalTime = now;
+        }
+    }
 }
 
 // Stopped containers may be retired, manually stopped, or completed jobs.
@@ -1152,6 +1580,9 @@ async function inspectContainer(name) {
                         <div class="drawer-stat-value">${escapeHtml(ramStr)}</div>
                     </div>
                 </div>
+                <div class="mt-2 text-xs font-mono text-slate-400">
+                    <span>OOM killed: <strong id="drawerOomKilled" class="text-slate-300">Checking…</strong></span>
+                </div>
             </div>
 
             <div class="drawer-section">
@@ -1205,6 +1636,9 @@ async function inspectContainer(name) {
 
         const restartEl = document.getElementById('drawerRestarts');
         if (restartEl) restartEl.textContent = data.RestartCount ?? 0;
+
+        const oomEl = document.getElementById('drawerOomKilled');
+        if (oomEl) oomEl.textContent = state.OOMKilled ? 'Yes' : 'No';
 
         const netEl = document.getElementById('drawerNetworks');
         if (netEl) {
@@ -1323,6 +1757,8 @@ function closeModal() {
     modalGeneration++;
     modalPreviousFocus?.focus();
     document.getElementById('modalOverlay').classList.add('hidden');
+    document.getElementById('modalContent').innerHTML = '';
+    checkAutoResort();
 }
 
 window.addEventListener('keydown', (e) => {
@@ -1447,8 +1883,30 @@ document.addEventListener('click', event => {
 });
 document.getElementById('searchInput').value = typeof preferences.search === 'string' ? preferences.search : '';
 if (['cpu','mem','containers','name'].includes(preferences.sort)) document.getElementById('sortBy').value = preferences.sort;
-document.getElementById('searchInput').addEventListener('input', renderDashboard);
-document.getElementById('sortBy').addEventListener('change', renderDashboard);
+document.getElementById('searchInput').addEventListener('input', () => renderDashboard(true));
+document.getElementById('sortBy').addEventListener('change', () => renderDashboard(true));
+
+const pausedPill = document.getElementById('orderPausedPill');
+if (pausedPill) {
+    pausedPill.addEventListener('click', () => {
+        renderDashboard(true);
+    });
+}
+
+const stacksCont = document.getElementById('stacksContainer');
+if (stacksCont) {
+    stacksCont.addEventListener('pointerenter', () => { isPointerOverList = true; });
+    stacksCont.addEventListener('pointerleave', () => { isPointerOverList = false; checkAutoResort(); });
+    stacksCont.addEventListener('pointerover', (e) => {
+        if (e.target.closest('.stack-row, .container-row')) isPointerOverList = true;
+    });
+    stacksCont.addEventListener('pointerout', (e) => {
+        if (!e.relatedTarget || !stacksCont.contains(e.relatedTarget)) {
+            isPointerOverList = false;
+            checkAutoResort();
+        }
+    });
+}
 setQuickFilter(activeQuickFilter);
 fetchStats();
 startInterval();

@@ -257,6 +257,56 @@ def main():
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             page.screenshot(path='/tmp/dockpit-intel-mobile.png', full_page=True)
             page.locator('[data-action=close]').click()
+
+            # Verify stable list identity: DOM nodes patched in place, focus survived
+            page.locator('#qf-all').click()
+            if page.locator('#expandAll').get_attribute('aria-label') == 'Expand all stacks':
+                page.locator('#expandAll').click()
+            assert page.evaluate("""() => {
+                const row = document.querySelector('.container-row[data-value="broken"]');
+                row.focus();
+                const hadFocus = document.activeElement === row;
+                const initialElement = row;
+                // Simulate live data poll
+                renderDashboard(false);
+                const sameElement = document.querySelector('.container-row[data-value="broken"]');
+                const stillHasFocus = document.activeElement === sameElement;
+                return hadFocus && (initialElement === sameElement) && stillHasFocus;
+            }""")
+
+            # Verify hysteresis sorting logic (~10% margin, name tie-break)
+            assert page.evaluate("""() => {
+                const items = [
+                    { key: 'A', name: 'alpha', total_cpu: 10.0 },
+                    { key: 'B', name: 'beta', total_cpu: 10.5 }
+                ];
+                // Under CPU sort, B is higher by 0.5% (5%), which is less than 10% hysteresis margin. Order stays [A, B]
+                const order1 = hysteresisSort(items, ['A', 'B'], 'cpu').map(i => i.key);
+                if (order1[0] !== 'A' || order1[1] !== 'B') return false;
+
+                // When B jumps to 12.0% (20% higher than 10.0%), it overtakes A
+                items[1].total_cpu = 12.0;
+                const order2 = hysteresisSort(items, ['A', 'B'], 'cpu').map(i => i.key);
+                if (order2[0] !== 'B' || order2[1] !== 'A') return false;
+
+                // Stable tie-break by name when identical
+                items[0].total_cpu = 0; items[1].total_cpu = 0;
+                const order3 = hysteresisSort(items, ['B', 'A'], 'cpu').map(i => i.key);
+                return order3[0] === 'A' && order3[1] === 'B';
+            }""")
+
+            # Verify order paused pill display when user is engaged
+            assert page.evaluate("""() => {
+                expandedStacks.add('demo');
+                const pill = document.getElementById('orderPausedPill');
+                currentStackOrder = ['demo'];
+                pendingStackOrder = ['other', 'demo'];
+                updateOrderPausedPill();
+                const pillShownWhileEngaged = !pill.hidden;
+                expandedStacks.clear();
+                return pillShownWhileEngaged;
+            }""")
+
             assert not errors, errors
             assert not external, external
             assert not csp_errors, csp_errors
