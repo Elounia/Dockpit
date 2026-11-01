@@ -130,76 +130,33 @@ function formatBytesNoDec(numBytes) {
 }
 
 function updateTopKPIs(data) {
-    const sys = data.system || {};
-
-    // 1. Host CPU
-    const hostCpu = (sys.host_cpu_pct == null ? 'Unavailable' : sys.host_cpu_pct.toFixed(1));
-    document.getElementById('sysCpu').textContent = hostCpu === 'Unavailable' ? hostCpu : `${hostCpu} %`;
-    document.getElementById('sysCpuBar').style.width = (Number.isFinite(parseFloat(hostCpu)) ? Math.min(100, Math.max(0, parseFloat(hostCpu))) : 0) + '%';
-    document.getElementById('sysCpuCores').textContent = `${sys.cpus || 1} Cores`;
-    document.getElementById('sysLoad').textContent = sys.load_str || '-';
-
-    const dockerCpuEl = document.getElementById('sysDockerCpu');
-    const dockerTotal = (data.docker_total_cpu || 0).toFixed(1);
-    dockerCpuEl.textContent = `${dockerTotal}%`;
-
-    const dockerHostEl = document.getElementById('sysDockerHostCpu');
-    if (dockerHostEl) {
-        const hostShare = (dockerTotal / (sys.cpus || 1)).toFixed(1);
-        dockerHostEl.textContent = `(${hostShare}% host)`;
-    }
-
-    // 2. System RAM
-    document.getElementById('sysRam').textContent = sys.mem_used_formatted || '-';
-    document.getElementById('sysRamPct').textContent = sys.mem_pct == null ? 'Unavailable' : `${sys.mem_pct}%`;
-    document.getElementById('sysRamBar').style.width = Math.min(100, Math.max(3, sys.mem_pct || 0)) + '%';
-    document.getElementById('sysRamSub').textContent = `of ${sys.mem_total_formatted || 'Unavailable'}`;
-    document.getElementById('sysDockerRam').textContent = `${data.docker_total_mem_str || '0 B'} (${data.docker_total_mem_perc || 0}%)`;
-
-    // 3. System Storage
-    const rootDisk = sys.root_disk || {};
-    const rootUsed = formatBytesNoDec(rootDisk.used_bytes || sys.root_used_bytes || 0);
-    const rootTotal = formatBytesNoDec(rootDisk.total_bytes || sys.root_total_bytes || 0);
-    const rootPct = Math.round(rootDisk.pct !== undefined ? rootDisk.pct : (sys.root_pct || 0));
-    const nvmeStatsEl = document.getElementById('sysNvmeStats');
-    if (nvmeStatsEl) nvmeStatsEl.textContent = rootDisk.total_bytes == null ? 'Unavailable' : `${rootUsed} / ${rootTotal} (${rootPct}%)`;
-    const nvmeBarEl = document.getElementById('sysNvmeBar');
-    if (nvmeBarEl) nvmeBarEl.style.width = Math.min(100, Math.max(3, rootPct)) + '%';
-
-    document.getElementById('sysDataStats').textContent = 'Not configured';
-    document.getElementById('sysDataBar').style.width = '0%';
-    const dataDisk = sys.data_disk;
-    if (dataDisk) {
-        const dataUsed = formatBytesNoDec(dataDisk.used_bytes || 0);
-        const dataTotal = formatBytesNoDec(dataDisk.total_bytes || 0);
-        const dataPct = Math.round(dataDisk.pct || 0);
-        const dataStatsEl = document.getElementById('sysDataStats');
-        if (dataStatsEl) dataStatsEl.textContent = `${dataUsed} / ${dataTotal} (${dataPct}%)`;
-        const dataBarEl = document.getElementById('sysDataBar');
-        if (dataBarEl) dataBarEl.style.width = Math.min(100, Math.max(3, dataPct)) + '%';
-    }
-
-    // 4. Containers & Uptime
-    const runningCount = data.running_containers !== undefined ? data.running_containers : (data.total_containers || 0);
-    const totalCount = data.total_containers || runningCount;
-    document.getElementById('sysHealth').textContent = `${runningCount} / ${totalCount}`;
-    document.getElementById('sysUptime').textContent = `Uptime: ${sys.uptime_str || '-'}`;
-    document.getElementById('sysPids').textContent = data.total_pids || 0;
-    document.getElementById('count-all').textContent = totalCount;
-    const healthBar = document.getElementById('sysHealthBar');
-    if (healthBar) {
-        const healthPct = totalCount > 0 ? (runningCount / totalCount) * 100 : 100;
-        healthBar.style.width = healthPct + '%';
-    }
-    const cStatsEl = document.getElementById('sysContainerStats');
-    if (cStatsEl) {
-        const unhealthy = data.unhealthy_containers || 0;
-        if (unhealthy > 0) {
-            cStatsEl.innerHTML = `<span class="text-rose-400 font-medium">${unhealthy} unhealthy</span>`;
-        } else {
-            cStatsEl.innerHTML = `<span class="text-emerald-400 font-medium">${data.total_stacks || 0} stacks</span>`;
-        }
-    }
+    const sys = data.system || {}, gpu = sys.gpu || {}, devices = gpu.devices || [];
+    const text = (id, value) => { document.getElementById(id).textContent = value; };
+    const bar = (id, value) => {
+        const el = document.getElementById(id);
+        el.style.width = `${Math.min(100, Math.max(0, value || 0))}%`;
+        el.className = value >= 90 ? 'critical' : value >= 75 ? 'warning' : '';
+    };
+    text('sysCpu', sys.host_cpu_pct == null ? 'Unavailable' : `${sys.host_cpu_pct.toFixed(1)}%`);
+    text('sysCpuCores', `${sys.cpus || 1} cores · Docker ${(data.docker_host_cpu_perc || 0).toFixed(1)}%`);
+    bar('sysCpuBar', sys.host_cpu_pct);
+    text('sysRam', sys.mem_used_formatted || 'Unavailable');
+    text('sysRamSub', `of ${sys.mem_total_formatted || '—'} · ${sys.mem_pct ?? '—'}%`);
+    bar('sysRamBar', sys.mem_pct);
+    const disk = sys.root_disk || {};
+    text('sysNvmeStats', disk.total_bytes == null ? 'Unavailable' : formatBytesNoDec(disk.used_bytes));
+    text('storageSub', `of ${formatBytesNoDec(disk.total_bytes)} · ${disk.pct ?? '—'}% used`);
+    bar('sysNvmeBar', disk.pct);
+    const total = data.total_containers || 0, running = data.running_containers || 0;
+    text('sysHealth', `${running} / ${total}`);
+    text('sysUptime', `${data.total_stacks || 0} stacks · Up ${sys.uptime_str || '—'}`);
+    text('count-all', total);
+    bar('sysHealthBar', total ? running / total * 100 : 0);
+    document.getElementById('sysHealthBar').className = '';
+    text('sysGpu', gpu.utilization_pct != null ? `${gpu.utilization_pct.toFixed(1)}%` : devices.length ? devices.map(d => d.name).join(', ') : 'No GPU');
+    document.getElementById('sysGpu').classList.toggle('no-metrics', gpu.utilization_pct == null);
+    text('sysGpuName', gpu.utilization_pct != null ? devices.map(d => d.name).join(', ') : devices.length ? 'No usage data' : 'No GPU detected');
+    bar('sysGpuBar', gpu.utilization_pct);
 }
 
 function toggleStack(stackName) {
